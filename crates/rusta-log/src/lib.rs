@@ -310,31 +310,57 @@ impl PartitionLog {
     /// Read the committed batch containing an offset. Pass a reusable payload buffer.
     /// Return None at the high watermark and InvalidInput outside the readable range.
     pub fn batch_at(&self, offset: i64, payload: &mut Vec<u8>) -> io::Result<Option<Entry>> {
+        let mut found = None;
+        self.visit_batches(offset, payload, |entry, _| {
+            found = Some(entry);
+            Ok(false)
+        })?;
+        Ok(found)
+    }
+
+    /// Stream committed batches beginning with the batch containing the offset.
+    /// Return false from the visitor to stop reading. Payload memory is reused.
+    pub fn visit_batches(
+        &self,
+        offset: i64,
+        payload: &mut Vec<u8>,
+        mut visit: impl FnMut(Entry, &[u8]) -> io::Result<bool>,
+    ) -> io::Result<()> {
         self.ensure_available()?;
         if !(self.start().next_offset..=self.committed().next_offset).contains(&offset) {
             return Err(invalid("offset outside the committed log"));
         }
         if offset == self.committed().next_offset {
             payload.clear();
-            return Ok(None);
+            return Ok(());
         }
-        let i = self
+
+        let first = self
             .segments
             .partition_point(|segment| segment.end.next_offset <= offset);
-        let segment = self
-            .segments
-            .get(i)
-            .ok_or_else(|| corrupt("committed batch is missing"))?;
-        let mut scan = segment.scan(&self.root, u64::MAX, offset)?;
-        while let Some(entry) = scan.next(payload)? {
-            if entry.position.next_index >= self.committed().next_index {
-                break;
-            }
-            if entry.position.after(entry.record_count)?.next_offset > offset {
-                return Ok(Some(entry));
+        let mut found = false;
+        for segment in &self.segments[first..] {
+            let mut scan =
+                segment.scan(&self.root, u64::MAX, offset.max(segment.start.next_offset))?;
+            while let Some(entry) = scan.next(payload)? {
+                if entry.position.next_index >= self.committed().next_index {
+                    return Ok(());
+                }
+                if entry.record_count == 0
+                    || entry.position.after(entry.record_count)?.next_offset <= offset
+                {
+                    continue;
+                }
+                found = true;
+                if !visit(entry, payload)? {
+                    return Ok(());
+                }
             }
         }
-        Err(corrupt("committed batch is missing"))
+        if !found {
+            return Err(corrupt("committed batch is missing"));
+        }
+        Ok(())
     }
 
     /// Find the earliest matching committed record in offset order.
@@ -445,6 +471,15 @@ impl PartitionLog {
 
     /// Apply singleton retention to a committed log and return the number of removed segments.
     pub fn apply_retention(&mut self, policy: Retention) -> io::Result<usize> {
+        self.apply_retention_after(policy, || Ok(()))
+    }
+
+    /// Persist external state before a retention pass removes the source entries.
+    pub fn apply_retention_after(
+        &mut self,
+        policy: Retention,
+        before_removal: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<usize> {
         self.ensure_available()?;
         if self.end() != self.committed() {
             return Err(invalid(
@@ -472,6 +507,7 @@ impl PartitionLog {
         if removed == 0 {
             return Ok(0);
         }
+        before_removal()?;
         self.mutate(|log| {
             let last = &log.segments[removed - 1];
             log.save(Checkpoint {

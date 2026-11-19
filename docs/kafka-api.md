@@ -2,6 +2,8 @@
 
 **Status:** Stage 2 design proposal. The ranges below are the exact planned advertisement for the first compatible release. The running broker advertises a range only when its handlers and declared semantics are implemented and tested. The primary client target is `kafka-clients` 4.1.2 with Spring Kafka 4.0.x. Also pin and verify franz-go, confluent-kafka and rust-rdkafka before claiming their compatibility. [Kafka 4.1 protocol](https://kafka.apache.org/41/design/protocol/), [Kafka 4.1.2 message schemas](https://github.com/apache/kafka/tree/4.1.2/clients/src/main/resources/common/message), [Spring compatibility](https://spring.io/projects/spring-kafka/)
 
+The single-node data path currently advertises `ApiVersions`, `Metadata`, `CreateTopics`, `Produce`, `Fetch`, `ListOffsets`, `InitProducerId` and `OffsetForLeaderEpoch`. Consumers can assign partitions directly. Group APIs and the remaining AdminClient operations in the table are part of the release plan.
+
 | Key | API | Inclusive versions | First release behavior |
 |---:|---|---:|---|
 | 0 | Produce | 9–11 | Kafka record-batch v2, keys, values, headers, CreateTime, five codec modes, optional weaker ACKs, producer sequence validation and deduplication |

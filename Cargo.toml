@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/rusta-log"]
+members = ["crates/rusta-log", "crates/rusta-kafka", "crates/rusta-broker"]
 resolver = "3"
 
 [workspace.package]
