@@ -144,7 +144,14 @@ impl PartitionLog {
         if crc32c::crc32c(&batch[21..]) != u32::from_be_bytes(format::field(batch, 17)) {
             return Err(invalid("Kafka batch checksum mismatch"));
         }
-        self.append(term, append_timestamp_ms, record_count, timestamp, batch)
+        self.append(
+            term,
+            append_timestamp_ms,
+            record_count,
+            timestamp,
+            batch,
+            false,
+        )
     }
 
     /// Stage an opaque consensus entry without advancing the Kafka record offset.
@@ -154,7 +161,15 @@ impl PartitionLog {
         append_timestamp_ms: i64,
         payload: &[u8],
     ) -> io::Result<Entry> {
-        self.append(term, append_timestamp_ms, 0, i64::MIN, payload)
+        self.append(term, append_timestamp_ms, 0, i64::MIN, payload, false)
+    }
+
+    pub fn append_internal_in_new_segment(
+        &mut self,
+        term: u64,
+        payload: &[u8],
+    ) -> io::Result<Entry> {
+        self.append(term, 0, 0, i64::MIN, payload, true)
     }
 
     fn append(
@@ -164,6 +179,7 @@ impl PartitionLog {
         record_count: u32,
         record_timestamp: i64,
         payload: &[u8],
+        new_segment: bool,
     ) -> io::Result<Entry> {
         self.ensure_available()?;
         if term == 0 || term < self.last_term() || payload.len() > self.options.max_entry_bytes {
@@ -177,9 +193,11 @@ impl PartitionLog {
             payload_len: payload.len() as u32,
         };
         let next = entry.position.after(record_count)?;
-        let roll = self.segments.last().is_none_or(|segment| {
-            segment.bytes + HEADER_LEN + u64::from(entry.payload_len) > self.options.segment_bytes
-        });
+        let roll = new_segment
+            || self.segments.last().is_none_or(|segment| {
+                segment.bytes + HEADER_LEN + u64::from(entry.payload_len)
+                    > self.options.segment_bytes
+            });
         if roll && self.segments.len() == MAX_SEGMENTS {
             return Err(io::Error::other("partition segment limit reached"));
         }
@@ -266,6 +284,66 @@ impl PartitionLog {
                 ..log.checkpoint
             })?;
             Ok(committed)
+        })
+    }
+
+    /// Set a copied partition's offset base before its first consensus entry.
+    pub fn initialize_offset(&mut self, offset: i64) -> io::Result<()> {
+        self.ensure_available()?;
+        let base = self.start();
+        if offset < 0 || base.next_index != 1 {
+            return Err(invalid("invalid initial Kafka offset"));
+        }
+        if base.next_offset == offset {
+            return Ok(());
+        }
+        if base != Position::initial() || base != self.end() {
+            return Err(invalid("initial offset is already in use"));
+        }
+        let base = Position {
+            next_index: 1,
+            next_offset: offset,
+        };
+        self.mutate(|log| {
+            log.save(Checkpoint {
+                start: base,
+                committed: base,
+                durable: base,
+                start_term: 0,
+            })
+        })
+    }
+
+    /// Replace the log with a snapshot boundary after the caller has durably
+    /// saved its state machine. The caller supplies the next index and offset.
+    /// At the existing committed index this can discard only an identical prefix.
+    pub fn install_snapshot_base(&mut self, base: Position, term: u64) -> io::Result<()> {
+        self.ensure_available()?;
+        let committed = self.committed();
+        let committed_term = self.term(committed.next_index - 1)?;
+        if base.next_index <= 1
+            || base.next_index < committed.next_index
+            || base.next_offset < committed.next_offset
+            || term == 0
+            || term < committed_term
+            || (base.next_index == committed.next_index
+                && (base != committed || term != committed_term))
+        {
+            return Err(invalid("snapshot would replace a committed log boundary"));
+        }
+        self.mutate(|log| {
+            log.writer = None;
+            // An empty manifest makes every old segment unreachable. Recovery
+            // will remove them if a crash occurs after publication.
+            let checkpoint = Checkpoint {
+                start: base,
+                start_term: term,
+                durable: base,
+                committed: base,
+            };
+            log.save(checkpoint)?;
+            log.segments = recover(&log.root, checkpoint, &list(&log.root)?)?;
+            Ok(())
         })
     }
 
@@ -489,6 +567,15 @@ impl PartitionLog {
     /// Select a segment boundary without changing the physical log.
     /// Raft callers must commit the selected position before using it for reads.
     pub fn retention_boundary(&self, start: Position, policy: Retention) -> io::Result<Position> {
+        self.retention_boundary_with_legacy_time(start, policy, None)
+    }
+
+    pub fn retention_boundary_with_legacy_time(
+        &self,
+        start: Position,
+        policy: Retention,
+        legacy_append_ms: Option<i64>,
+    ) -> io::Result<Position> {
         self.ensure_available()?;
         if self.end() != self.committed()
             || !(self.start().next_index..=self.committed().next_index).contains(&start.next_index)
@@ -516,9 +603,16 @@ impl PartitionLog {
         let mut bytes = segments.iter().map(|segment| segment.bytes).sum::<u64>() - prefix_bytes;
         let mut boundary = start;
         for (index, segment) in segments.iter().enumerate() {
+            let append_ms = if segment.has_legacy_records {
+                segment
+                    .max_append_timestamp
+                    .max(legacy_append_ms.unwrap_or(0))
+            } else {
+                segment.max_append_timestamp
+            };
             let expired = policy
                 .keep_since_ms
-                .is_some_and(|cutoff| segment.max_append_timestamp < cutoff);
+                .is_some_and(|cutoff| append_ms < cutoff);
             let oversized =
                 index + 1 < segments.len() && policy.max_bytes.is_some_and(|limit| bytes > limit);
             if !expired && !oversized {
@@ -542,13 +636,43 @@ impl PartitionLog {
         before_removal: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<usize> {
         let boundary = self.retention_boundary(self.start(), policy)?;
+        if boundary == self.start() {
+            return Ok(0);
+        }
+        before_removal()?;
+        self.compact_prefix(boundary)
+    }
+
+    /// Return the last whole segment that can be removed below the consensus index.
+    pub fn compactable_prefix(&self, next_index: u64) -> Position {
+        let next_index = next_index.min(self.committed().next_index);
+        let count = self
+            .segments
+            .partition_point(|segment| segment.end.next_index <= next_index);
+        count
+            .checked_sub(1)
+            .map_or(self.start(), |index| self.segments[index].end)
+    }
+
+    pub fn first_compactable_segment(&self, next_index: u64) -> Option<Position> {
+        let limit = next_index.min(self.committed().next_index);
+        self.segments
+            .first()
+            .and_then(|segment| (segment.end.next_index <= limit).then_some(segment.end))
+    }
+
+    /// Reclaim fully committed segments after the caller publishes its snapshot.
+    pub fn compact_prefix(&mut self, boundary: Position) -> io::Result<usize> {
+        self.ensure_available()?;
+        if self.compactable_prefix(boundary.next_index) != boundary {
+            return Err(invalid("compaction requires a committed segment boundary"));
+        }
         let removed = self
             .segments
             .partition_point(|segment| segment.end.next_index <= boundary.next_index);
         if removed == 0 {
             return Ok(0);
         }
-        before_removal()?;
         self.mutate(|log| {
             let last = &log.segments[removed - 1];
             log.save(Checkpoint {

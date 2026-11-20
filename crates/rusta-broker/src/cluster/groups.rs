@@ -157,6 +157,7 @@ impl Cluster {
     pub async fn leave_group(
         self: &Arc<Self>,
         request: messages::LeaveGroupRequest,
+        version: i16,
     ) -> Result<messages::LeaveGroupResponse> {
         let error_response =
             |error: Error| messages::LeaveGroupResponse::default().with_error_code(error as i16);
@@ -167,7 +168,7 @@ impl Cluster {
         let result = self
             .call(move |engine| {
                 engine.with_group(key, term, |groups, _| {
-                    group_protocol::leave_group(groups, request)
+                    group_protocol::leave_group(groups, request, version)
                 })
             })
             .await?;

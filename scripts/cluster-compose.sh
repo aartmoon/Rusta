@@ -27,7 +27,7 @@ done
 cat <<YAML
 x-broker: &broker
   build: .
-  image: rusta:local
+  image: \${RUSTA_IMAGE:-rusta:local}
   cpus: 1.0
   mem_limit: 512m
   healthcheck:
@@ -41,6 +41,7 @@ x-env: &cluster-env
   RUSTA_CLUSTER_PEERS: "$peers"
   RUSTA_CLUSTER_CERTS: /etc/rusta/pki
   RUSTA_INTERNAL_BIND: 0.0.0.0:29092
+  RUSTA_CLUSTER_SNAPSHOT_INTERVAL: "\${RUSTA_CLUSTER_SNAPSHOT_INTERVAL:-4096}"
 YAML
 if [[ -n "$bootstrap" ]]; then
     printf '  RUSTA_BOOTSTRAP_VOTERS: "%s"\n' "$bootstrap"

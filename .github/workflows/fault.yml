@@ -1,0 +1,69 @@
+name: Fault and upgrade tests
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  faults:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [cluster, cluster-groups, membership, decommission, topology, migration, admin]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          cache-dependency-path: tests/java/pom.xml
+      - run: tests/java/${{ matrix.suite }}-smoke.sh
+
+  compatibility:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: tests/compat/go/go.mod
+          cache-dependency-path: tests/compat/go/go.sum
+      - run: tests/compat/smoke.sh
+
+  disk-full:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - run: |
+          docker run --rm --mount "type=bind,src=$PWD,dst=/src,readonly" --tmpfs /disk:size=16m             -w /src -e CARGO_TARGET_DIR=/target -e RUSTA_TEST_FULL_DISK_DIR=/disk             rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea             cargo test --locked -p rusta-log --test recovery full_disk_preserves_the_committed_prefix -- --ignored
+
+  upgrade:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          cache-dependency-path: tests/java/pom.xml
+      - run: tests/release/upgrade.sh

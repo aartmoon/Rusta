@@ -24,6 +24,8 @@ pub struct TopicConfig {
     pub retention_ms: Option<i64>,
     #[serde(default)]
     pub retention_bytes: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_retention_since_ms: Option<i64>,
 }
 
 pub struct Topic {
@@ -48,6 +50,8 @@ enum Event {
     Cluster(Uuid),
     Topic(TopicConfig),
     ReserveProducers(i64),
+    Alter(TopicConfig),
+    Delete { name: String, id: Uuid },
 }
 
 impl Catalog {
@@ -60,7 +64,7 @@ impl Catalog {
         File::open(root)?.sync_all()?;
 
         let mut cluster_id = None;
-        let mut topics = BTreeMap::new();
+        let mut configs = BTreeMap::<String, TopicConfig>::new();
         let mut names_by_id = HashMap::new();
         let mut partition_count = 0;
         let mut last_reserved_producer = 0;
@@ -80,13 +84,11 @@ impl Catalog {
                         if partition_count > MAX_PARTITIONS
                             || config.partitions == 0
                             || names_by_id.insert(config.id, config.name.clone()).is_some()
-                            || topics.contains_key(&config.name)
+                            || configs.contains_key(&config.name)
                         {
                             return Err(std::io::Error::other("invalid topic catalog entry"));
                         }
-                        let topic =
-                            open_topic(&data_dir, config, false).map_err(std::io::Error::other)?;
-                        topics.insert(topic.config.name.clone(), topic);
+                        configs.insert(config.name.clone(), config);
                     }
                     Event::ReserveProducers(high) => {
                         if high <= last_reserved_producer {
@@ -95,6 +97,25 @@ impl Catalog {
                             ));
                         }
                         last_reserved_producer = high;
+                    }
+                    Event::Alter(config) => {
+                        let old = configs
+                            .get_mut(&config.name)
+                            .ok_or_else(|| std::io::Error::other("altered topic missing"))?;
+                        if old.id != config.id || old.partitions != config.partitions {
+                            return Err(std::io::Error::other("altered topic identity changed"));
+                        }
+                        *old = config;
+                    }
+                    Event::Delete { name, id } => {
+                        let config = configs
+                            .remove(&name)
+                            .filter(|config| config.id == id)
+                            .ok_or_else(|| {
+                                std::io::Error::other("deleted topic identity mismatch")
+                            })?;
+                        names_by_id.remove(&id);
+                        partition_count -= config.partitions;
                     }
                 }
                 Ok(())
@@ -110,6 +131,21 @@ impl Catalog {
                 id
             }
         };
+        let topics = configs
+            .into_iter()
+            .map(|(name, config)| open_topic(&data_dir, config, false).map(|topic| (name, topic)))
+            .collect::<Result<_>>()?;
+        for entry in fs::read_dir(&data_dir)? {
+            let entry = entry?;
+            if let Some(id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|value| Uuid::parse_str(value).ok())
+                && !names_by_id.contains_key(&id)
+            {
+                remove_topic_data(&data_dir, &entry.path())?;
+            }
+        }
         Ok(Self {
             groups: Groups::open(&root.join("groups"))?,
             topics,
@@ -135,6 +171,29 @@ impl Catalog {
         self.names_by_id
             .insert(topic.config.id, topic.config.name.clone());
         self.topics.insert(topic.config.name.clone(), topic);
+        Ok(())
+    }
+
+    pub fn alter_topic(&mut self, config: TopicConfig) -> Result<()> {
+        store(&mut self.state, &Event::Alter(config.clone()))?;
+        let topic = self.topics.get_mut(&config.name).expect("existing topic");
+        topic.config = config;
+        Ok(())
+    }
+
+    pub fn delete_topic(&mut self, name: String, id: Uuid) -> Result<()> {
+        store(
+            &mut self.state,
+            &Event::Delete {
+                name: name.clone(),
+                id,
+            },
+        )?;
+        let topic = self.topics.remove(&name).expect("existing topic");
+        self.partition_count -= topic.config.partitions;
+        self.names_by_id.remove(&id);
+        drop(topic);
+        remove_topic_data(&self.data_dir, &self.data_dir.join(id.to_string()))?;
         Ok(())
     }
 
@@ -168,6 +227,14 @@ impl Catalog {
 
     pub fn last_reserved_producer(&self) -> i64 {
         self.last_reserved_producer
+    }
+}
+
+pub fn remove_topic_data(root: &Path, path: &Path) -> std::io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => File::open(root)?.sync_all(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 

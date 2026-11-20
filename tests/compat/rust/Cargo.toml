@@ -1,0 +1,11 @@
+[package]
+name = "rusta-compat"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+rdkafka = "=0.38.0"
+tokio = { version = "=1.52.3", features = ["macros", "rt", "time"] }

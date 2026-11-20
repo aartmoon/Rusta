@@ -66,6 +66,10 @@ impl History {
 }
 
 impl Partition {
+    pub fn producer_histories(&self) -> &HashMap<i64, History> {
+        &self.producers
+    }
+
     pub fn open(path: PathBuf) -> Result<Self> {
         let log = PartitionLog::open(
             &path,

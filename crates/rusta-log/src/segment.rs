@@ -20,6 +20,7 @@ pub(crate) struct Segment {
     pub bytes: u64,
     pub last_term: u64,
     pub max_append_timestamp: i64,
+    pub has_legacy_records: bool,
     pub max_record_timestamp: i64,
     index: Vec<Cursor>,
     stride: u64,
@@ -33,6 +34,7 @@ impl Segment {
             bytes: 0,
             last_term: 0,
             max_append_timestamp: i64::MIN,
+            has_legacy_records: false,
             max_record_timestamp: i64::MIN,
             index: Vec::new(),
             stride: INDEX_INTERVAL,
@@ -62,6 +64,7 @@ impl Segment {
         self.bytes += HEADER_LEN + u64::from(entry.payload_len);
         self.last_term = entry.term;
         self.max_append_timestamp = self.max_append_timestamp.max(entry.append_timestamp_ms);
+        self.has_legacy_records |= entry.record_count != 0 && entry.append_timestamp_ms == 0;
         self.max_record_timestamp = self.max_record_timestamp.max(max_record_timestamp);
     }
 

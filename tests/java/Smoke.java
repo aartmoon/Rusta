@@ -34,7 +34,7 @@ public final class Smoke {
         String endpoint = args[1];
         switch (mode) {
             case "write" -> write(endpoint, Path.of(args[2]));
-            case "verify" -> verify(endpoint, Path.of(args[2]));
+            case "verify", "verify-migration" -> verify(endpoint, Path.of(args[2]), mode.equals("verify-migration"));
             case "internal" -> {
                 try (Admin admin = Admin.create(base(endpoint))) {
                     check(admin.describeTopics(List.of(TOPIC)).allTopicNames().get(10, TimeUnit.SECONDS)
@@ -103,16 +103,30 @@ public final class Smoke {
         checkReads(endpoint);
     }
 
-    private static void verify(String endpoint, Path saved) throws Exception {
+    private static void verify(String endpoint, Path saved, boolean migration) throws Exception {
         var identity = Files.readAllLines(saved);
+        String mainLeader = endpoint;
+        String expiredLeader = endpoint;
         try (Admin admin = Admin.create(base(endpoint))) {
-            var info = admin.describeTopics(List.of(TOPIC)).allTopicNames().get(10, TimeUnit.SECONDS).get(TOPIC);
+            var topics = admin.describeTopics(List.of(TOPIC, EXPIRED)).allTopicNames().get(10, TimeUnit.SECONDS);
+            var info = topics.get(TOPIC);
             check(info.topicId().toString().equals(identity.get(0)), "topic ID changed after restart");
+            if (migration) {
+                var main = info.partitions().getFirst().leader();
+                var expired = topics.get(EXPIRED).partitions().getFirst().leader();
+                mainLeader = main.host() + ":" + main.port();
+                expiredLeader = expired.host() + ":" + expired.port();
+                var init = new InitProducerIdRequest.Builder(new InitProducerIdRequestData()
+                    .setTransactionalId(null).setTransactionTimeoutMs(10_000)).build((short) 4);
+                var fresh = ((InitProducerIdResponse) exchange(mainLeader, init, 7)).data();
+                check(fresh.errorCode() == 0 && fresh.producerId() > 4096,
+                    "cluster reused the singleton producer namespace");
+            }
         }
         long producer = Long.parseLong(identity.get(1));
         short epoch = Short.parseShort(identity.get(2));
-        check(sendRetry(endpoint, TOPIC, producer, epoch, 4) == 6, "restart lost durable producer retry state");
-        check(sendRetry(endpoint, EXPIRED, producer, epoch, 6) == 0, "retention erased producer retry state");
+        check(sendRetry(mainLeader, TOPIC, producer, epoch, 4) == 6, "restart lost durable producer retry state");
+        check(sendRetry(expiredLeader, EXPIRED, producer, epoch, 6) == 0, "retention erased producer retry state");
         checkExpired(endpoint);
         checkReads(endpoint);
     }

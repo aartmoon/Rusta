@@ -11,18 +11,32 @@ const API_RANGES: &[(i16, i16, i16)] = &[
     (3, 9, 12),  // Metadata
     (8, 8, 9),   // OffsetCommit
     (9, 6, 9),   // OffsetFetch
-    (10, 3, 4),  // FindCoordinator
-    (11, 6, 9),  // JoinGroup
-    (12, 4, 4),  // Heartbeat
-    (13, 4, 5),  // LeaveGroup
-    (14, 4, 5),  // SyncGroup
+    (10, 2, 4),  // FindCoordinator
+    (11, 5, 9),  // JoinGroup
+    (12, 3, 4),  // Heartbeat
+    (13, 1, 5),  // LeaveGroup
+    (14, 3, 5),  // SyncGroup
     (15, 5, 6),  // DescribeGroups
     (16, 3, 5),  // ListGroups
     (18, 0, 4),  // ApiVersions
-    (19, 5, 7),  // CreateTopics
+    (19, 4, 7),  // CreateTopics
+    (20, 1, 6),  // DeleteTopics
     (22, 2, 4),  // InitProducerId
-    (23, 4, 4),  // OffsetForLeaderEpoch
+    (23, 2, 4),  // OffsetForLeaderEpoch
+    (32, 1, 4),  // DescribeConfigs
+    (44, 1, 1),  // IncrementalAlterConfigs
 ];
+
+fn flexible(key: i16, version: i16) -> bool {
+    let min = match key {
+        10 | 18 => 3,
+        11 => 6,
+        12 | 13 | 14 | 20 | 23 | 32 => 4,
+        19 => 5,
+        _ => 0,
+    };
+    version >= min
+}
 
 pub enum Request {
     OffsetCommit(messages::OffsetCommitRequest),
@@ -37,6 +51,9 @@ pub enum Request {
     ApiVersions(messages::ApiVersionsRequest),
     Metadata(messages::MetadataRequest),
     CreateTopics(messages::CreateTopicsRequest),
+    DeleteTopics(messages::DeleteTopicsRequest),
+    DescribeConfigs(messages::DescribeConfigsRequest),
+    IncrementalAlterConfigs(messages::IncrementalAlterConfigsRequest),
     Produce(messages::ProduceRequest),
     Fetch(messages::FetchRequest),
     ListOffsets(messages::ListOffsetsRequest),
@@ -92,6 +109,7 @@ pub fn decode(mut frame: Bytes) -> Result<(Header, Request)> {
     let mut cursor = Guard {
         bytes: &frame,
         items: 0,
+        flexible: flexible(header.key, version),
     };
     let client_id = cursor.take(2)?.try_into().map(i16::from_be_bytes).unwrap();
     ensure!(client_id >= -1, "invalid client ID length");
@@ -99,21 +117,37 @@ pub fn decode(mut frame: Bytes) -> Result<(Header, Request)> {
     if client.len() <= 256 {
         header.client_id = client.to_owned();
     }
-    if header.key != 18 || version >= 3 {
-        cursor.tags()?;
-    }
+    cursor.tags()?;
     let skipped = frame.len() - cursor.bytes.len();
     let items = cursor.items;
+    let flexible = cursor.flexible;
     frame.advance(skipped);
 
     // The generated array decoder preallocates from the wire count. Bound every
     // collection before calling it, and retain its normal typed decoding.
-    let mut guard = Guard {
-        bytes: &frame,
-        items,
+    let validate = |bytes| {
+        let mut guard = Guard {
+            bytes,
+            items,
+            flexible,
+        };
+        guard.body(header.key, version)?;
+        ensure!(
+            guard.bytes.is_empty(),
+            "extra bytes after Kafka API {} v{version}",
+            header.key
+        );
+        Ok(())
     };
-    guard.body(header.key, version)?;
-    ensure!(guard.bytes.is_empty(), "extra bytes after Kafka request");
+    if let Err(error) = validate(&frame) {
+        // librdkafka 2.12.1 reserves four zero bytes for the compact null
+        // topic array in its request for all topics.
+        if header.key != 3 || !frame.starts_with(&[0; 4]) {
+            return Err(error);
+        }
+        validate(&frame[3..])?;
+        frame.advance(3);
+    }
 
     let request = match header.key {
         0 => Request::Produce(messages::ProduceRequest::decode(&mut frame, version)?),
@@ -135,10 +169,17 @@ pub fn decode(mut frame: Bytes) -> Result<(Header, Request)> {
         16 => Request::ListGroups(messages::ListGroupsRequest::decode(&mut frame, version)?),
         18 => Request::ApiVersions(messages::ApiVersionsRequest::decode(&mut frame, version)?),
         19 => Request::CreateTopics(messages::CreateTopicsRequest::decode(&mut frame, version)?),
+        20 => Request::DeleteTopics(messages::DeleteTopicsRequest::decode(&mut frame, version)?),
         22 => Request::InitProducerId(messages::InitProducerIdRequest::decode(
             &mut frame, version,
         )?),
         23 => Request::OffsetForLeaderEpoch(messages::OffsetForLeaderEpochRequest::decode(
+            &mut frame, version,
+        )?),
+        32 => Request::DescribeConfigs(messages::DescribeConfigsRequest::decode(
+            &mut frame, version,
+        )?),
+        44 => Request::IncrementalAlterConfigs(messages::IncrementalAlterConfigsRequest::decode(
             &mut frame, version,
         )?),
         _ => unreachable!(),
@@ -152,7 +193,7 @@ pub fn decode(mut frame: Bytes) -> Result<(Header, Request)> {
 
 pub fn encode(header: &Header, version: i16, response: &impl Encodable) -> Result<Bytes> {
     let body_len = response.compute_size(version)?;
-    let flex = header.key != 18;
+    let flex = header.key != 18 && flexible(header.key, version);
     let frame_len = body_len + 4 + usize::from(flex);
     ensure!(frame_len <= MAX_FRAME, "response exceeds the frame budget");
     let mut output = BytesMut::with_capacity(frame_len + 4);
@@ -172,6 +213,7 @@ pub fn encode(header: &Header, version: i16, response: &impl Encodable) -> Resul
 struct Guard<'a> {
     bytes: &'a [u8],
     items: usize,
+    flexible: bool,
 }
 
 impl<'a> Guard<'a> {
@@ -196,9 +238,30 @@ impl<'a> Guard<'a> {
     }
 
     fn compact(&mut self) -> Result<()> {
-        let size = self.varuint()?.saturating_sub(1) as usize;
+        let size = if self.flexible {
+            self.varuint()?.saturating_sub(1) as usize
+        } else {
+            let size = i16::from_be_bytes(self.take(2)?.try_into().unwrap());
+            ensure!(size >= -1, "invalid Kafka string length");
+            size.max(0) as usize
+        };
         self.take(size)?;
         Ok(())
+    }
+
+    fn binary(&mut self) -> Result<()> {
+        if self.flexible {
+            return self.compact();
+        }
+        let size = self.classic_length()?;
+        self.take(size)?;
+        Ok(())
+    }
+
+    fn classic_length(&mut self) -> Result<usize> {
+        let size = i32::from_be_bytes(self.take(4)?.try_into().unwrap());
+        ensure!(size >= -1, "invalid Kafka collection length");
+        Ok(size.max(0) as usize)
     }
 
     fn charge(&mut self, count: usize) -> Result<()> {
@@ -211,7 +274,11 @@ impl<'a> Guard<'a> {
     }
 
     fn array(&mut self, mut element: impl FnMut(&mut Self) -> Result<()>) -> Result<()> {
-        let count = self.varuint()?.saturating_sub(1) as usize;
+        let count = if self.flexible {
+            self.varuint()?.saturating_sub(1) as usize
+        } else {
+            self.classic_length()?
+        };
         self.charge(count)?;
         for _ in 0..count {
             element(self)?;
@@ -220,6 +287,9 @@ impl<'a> Guard<'a> {
     }
 
     fn tags(&mut self) -> Result<()> {
+        if !self.flexible {
+            return Ok(());
+        }
         let count = self.varuint()? as usize;
         self.charge(count)?;
         let mut previous = None;
@@ -296,7 +366,11 @@ impl<'a> Guard<'a> {
                 self.compact()?;
             }
             2 | 23 => {
-                self.take(if key == 2 { 5 } else { 4 })?;
+                if key == 2 {
+                    self.take(5)?;
+                } else if version >= 3 {
+                    self.take(4)?;
+                }
                 self.array(|topic| {
                     topic.compact()?;
                     topic.array(|partition| {
@@ -350,7 +424,7 @@ impl<'a> Guard<'a> {
                 }
             }
             10 => {
-                if version == 3 {
+                if version <= 3 {
                     self.compact()?;
                 }
                 self.take(1)?;
@@ -363,7 +437,8 @@ impl<'a> Guard<'a> {
                 self.take(8)?;
                 self.compact_many(3)?;
                 self.array(|protocol| {
-                    protocol.compact_many(2)?;
+                    protocol.compact()?;
+                    protocol.binary()?;
                     protocol.tags()
                 })?;
                 if version >= 8 {
@@ -379,17 +454,22 @@ impl<'a> Guard<'a> {
                         self.compact_many(2)?;
                     }
                     self.array(|member| {
-                        member.compact_many(2)?;
+                        member.compact()?;
+                        member.binary()?;
                         member.tags()
                     })?;
                 }
             }
             13 => {
                 self.compact()?;
-                self.array(|member| {
-                    member.compact_many(if version >= 5 { 3 } else { 2 })?;
-                    member.tags()
-                })?;
+                if version < 3 {
+                    self.compact()?;
+                } else {
+                    self.array(|member| {
+                        member.compact_many(if version >= 5 { 3 } else { 2 })?;
+                        member.tags()
+                    })?;
+                }
             }
             15 => {
                 self.array(Self::compact)?;
@@ -429,6 +509,41 @@ impl<'a> Guard<'a> {
                 })?;
                 self.take(5)?;
             }
+            20 => {
+                if version == 6 {
+                    self.array(|topic| {
+                        topic.compact()?;
+                        topic.take(16)?;
+                        topic.tags()
+                    })?;
+                } else {
+                    self.array(Self::compact)?;
+                }
+                self.take(4)?;
+            }
+            32 => {
+                self.array(|resource| {
+                    resource.take(1)?;
+                    resource.compact()?;
+                    resource.array(Self::compact)?;
+                    resource.tags()
+                })?;
+                self.take(if version >= 3 { 2 } else { 1 })?;
+            }
+            44 => {
+                self.array(|resource| {
+                    resource.take(1)?;
+                    resource.compact()?;
+                    resource.array(|config| {
+                        config.compact()?;
+                        config.take(1)?;
+                        config.compact()?;
+                        config.tags()
+                    })?;
+                    resource.tags()
+                })?;
+                self.take(1)?;
+            }
             22 => {
                 self.compact()?;
                 self.take(if version >= 3 { 14 } else { 4 })?;
@@ -454,6 +569,21 @@ mod tests {
         bytes.extend_from_slice(&[255, 255, 255, 255, 7, 0, 0, 0, 0, 0, 0]);
         let error = decode(bytes.freeze()).err().unwrap();
         assert!(error.to_string().contains("collection"));
+    }
+
+    #[test]
+    fn accepts_librdkafka_metadata_with_a_padded_null_topic_array() {
+        let mut bytes = BytesMut::new();
+        let header = messages::RequestHeader::default()
+            .with_request_api_key(3)
+            .with_request_api_version(12);
+        encode_request_header_into_buffer(&mut bytes, &header).unwrap();
+        bytes.extend_from_slice(&[0, 0, 0, 0, 1, 0, 0]);
+        let (_, request) = decode(bytes.freeze()).unwrap();
+        let Request::Metadata(request) = request else {
+            panic!("wrong request");
+        };
+        assert!(request.topics.is_none() && request.allow_auto_topic_creation);
     }
 
     #[test]
@@ -485,8 +615,11 @@ mod tests {
                     16 => check(key, v, messages::ListGroupsRequest::default()),
                     18 => check(key, v, messages::ApiVersionsRequest::default()),
                     19 => check(key, v, messages::CreateTopicsRequest::default()),
+                    20 => check(key, v, messages::DeleteTopicsRequest::default()),
                     22 => check(key, v, messages::InitProducerIdRequest::default()),
                     23 => check(key, v, messages::OffsetForLeaderEpochRequest::default()),
+                    32 => check(key, v, messages::DescribeConfigsRequest::default()),
+                    44 => check(key, v, messages::IncrementalAlterConfigsRequest::default()),
                     _ => unreachable!(),
                 }
             }

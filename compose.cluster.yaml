@@ -1,6 +1,6 @@
 x-broker: &broker
   build: .
-  image: rusta:local
+  image: ${RUSTA_IMAGE:-rusta:local}
   cpus: 1.0
   mem_limit: 512m
   healthcheck:
@@ -14,6 +14,7 @@ x-cluster-env: &cluster-env
   RUSTA_CLUSTER_PEERS: "1,raft1:7000,127.0.0.1:${RUSTA_PORT_1:-19092},broker1:29092;2,raft2:7000,127.0.0.1:${RUSTA_PORT_2:-19093},broker2:29092;3,raft3:7000,127.0.0.1:${RUSTA_PORT_3:-19094},broker3:29092"
   RUSTA_CLUSTER_CERTS: /etc/rusta/pki
   RUSTA_INTERNAL_BIND: 0.0.0.0:29092
+  RUSTA_CLUSTER_SNAPSHOT_INTERVAL: "${RUSTA_CLUSTER_SNAPSHOT_INTERVAL:-4096}"
   RUSTA_DEBUG_CONNECTIONS: "${RUSTA_DEBUG_CONNECTIONS:-0}"
 
 services:

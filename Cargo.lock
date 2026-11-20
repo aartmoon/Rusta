@@ -513,6 +513,7 @@ dependencies = [
  "crc32c",
  "protobuf",
  "raft",
+ "ring",
  "rusta-kafka",
  "rusta-log",
  "rustls-pemfile",
@@ -523,6 +524,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "uuid",
+ "zstd",
 ]
 
 [[package]]

@@ -40,7 +40,7 @@ Group commit shares synchronization across waiting appends with a bounded byte t
 
 After a crash, read the last valid manifest, validate the journal and rebuild missing indexes with bounded I/O. A demonstrably incomplete uncommitted tail can be discarded. Corruption inside the retained durable prefix makes the local copy unavailable. A cluster replaces it from a healthy peer. An affected singleton reports the error and needs operator recovery. Successful writes can subsequently disappear from reads through retention or topic deletion.
 
-Retention advances a replicated log-start offset on sealed segment boundaries. Raft log compaction can discard obsolete consensus entries only after a durable checkpoint. A checkpoint includes the applied Raft index and term, high watermark, retained log range, current membership and producer state. A learner whose required entries have been compacted receives a checksummed snapshot and its retained segments in bounded chunks, then catches up on the live suffix. Staging becomes active only after files and manifest are durable. Bound staging disk usage and snapshot lifetimes. If retention overtakes a transfer, retry from a newer snapshot. Active readers hold a bounded reference to each file they use while a concurrent retention pass unlinks obsolete segments.
+Retention advances a replicated log-start offset on segment boundaries. A user partition snapshot covers the removed prefix. Its position includes the last included Raft index and term, the next Kafka offset, the last compacted batch epoch, membership and producer history. The live Raft suffix carries all retained records. A learner that needs the removed prefix installs the snapshot first and then receives the suffix in bounded appends.
 
 ## Cluster retention boundary
 
@@ -53,13 +53,9 @@ entry. Size-based retention keeps the last segment. Earliest offset, timestamp
 search and Fetch use the Kafka-visible start. Leader epoch lookups use the
 preserved history and clamp end offsets to the visible range.
 
-Physical retention requires a recoverable state snapshot and a follower install
-path. A snapshot must bind its last included index and term to membership, the
-Kafka retained range and the state needed to validate idempotent retries.
-Controller and group snapshots also need their applied metadata or committed
-offsets and generation fences. Stage and validate bounded chunks before
-publishing the new checkpoint. Preserve the prior checkpoint and history
-until publication succeeds.
+The version-1 `RUSTAD01` checkpoint contains a CRC32C-protected JSON payload. A partition uses up to 512 KiB. An internal checkpoint wraps that metadata and a Zstandard-compressed JSON state in a CRC32C-protected `RUSTAI01` envelope. The controller captures topic and producer allocation metadata, original and current placements, retired IDs and the last completed rebalance. It checkpoints between relocations, so the journal still carries any active plan and its progress. Group shards capture offset metadata, generation fences and empty-group times. Brokers preserve the public Kafka epoch stored in each batch independently of the Raft term.
+
+The peer transport transfers snapshots in 256 KiB chunks on separate authenticated connections, with up to 8 MiB/s per transfer and a 12 MiB serialized state cap. The receiver reserves bytes before buffering the payload and validates the complete snapshot before installation. The snapshot file is synced before the Raft manifest changes. The old prefix remains recoverable until publication succeeds. A dropped transfer releases its reservation, and Raft retries after its snapshot deadline. A destination absent at the snapshot index enters the restored configuration as a nonvoting learner and replays its membership change from the suffix.
 
 ## Kafka reads, producer retries and group state
 
@@ -76,14 +72,11 @@ The single-node coordinator uses a local segmented journal for group generations
 
 The current cluster stores a fixed volume identity, term, vote and durable log for each Raft group. It replicates the topic catalog across the startup roster and writes partition records to the replica sets recorded in catalog events. A restarting replica catches up from retained entries. The control log and each partition log have independent elections. Brokers without a partition replica learn its leader from expiring reports authenticated by mTLS. Producer IDs use a durable per-node counter and a node prefix. Reuse a node's existing volume on restart.
 
-A provisioned reserve broker registers over the authenticated peer channel. The controller commits learner admission, observes its durable log position, then commits its promotion. The two single-member Raft changes run sequentially. Membership is reconstructed from the committed control log at restart. Kafka metadata and new topic placement use the committed voters. Existing data replica sets retain their assignments.
+A provisioned broker registers over the authenticated peer channel. Operators can stage a node on a running broker through the private admin socket. Each stage-peer operation stores the endpoint specification and its SHA-256 binding to a CA-validated leaf on that broker's volume. Current controller members report that binding over mTLS. The controller waits for matching reports before admitting a dynamically staged node, adds it as a learner and promotes it after durable catch-up. Kafka metadata and new topic placement use committed voters.
 
+A joining broker proves its node identity using mTLS, the expected cluster ID and the original bootstrap voter mask. A data volume binds to its original cluster, node ID and bootstrap voter list. The controller permanently records retired IDs. Certificate rotation updates pinned identities under the stopped broker's volume lock. See the [operator procedures](../README.md#rotate-peer-certificates).
 
-The seed endpoints identify candidate peers. A joining broker proves its node identity using mTLS and the expected cluster identity. Persist its assigned controller record, term and local node ID before making it eligible for placement. Registration adds capacity for data replicas. It does not automatically resize the controller voters. Bootstrap three controller voters in the standard cluster. A controller replacement is an explicit, persisted learner and membership operation. Cluster credentials and broker ID are bound to a node. Starting an existing data volume with a different identity or cluster ID fails.
-
-The controller persists reassignment intent. For each move, add a learner, stream the snapshot or suffix, wait for durable catch-up, then change voting membership through Raft joint consensus. Transfer leadership when the target is ready. Remove the old replica only after the successor configuration commits. Reconcile intent after restart and cap concurrent moves and transfer rate. Placement balances leaders and replicas and enforces one replica per configured host identity in the production RF3 profile.
-
-The current decommission command persists its request on the departing broker and sends it over the authenticated peer transport. The controller commits the move plan and serializes partition moves. Each partition commits separate single-member Raft changes for learner addition, promotion and removal. The temporary voting set contains both the source and the replacement, so each transition has overlapping majorities. The partition leader checks durable progress on the replacement and a majority of the surviving voters before removal. The controller publishes the new placement only after a surviving partition leader reports the committed membership. It removes the departing controller voter after all partition moves finish and records the retired broker ID in the controller log. Recovery replays both logs and continues the active plan. The transfer currently uses the retained log.
+The current decommission command persists its request on the departing broker and sends it over the authenticated peer transport. The controller commits the move plan and serializes partition moves. Each partition commits separate single-member Raft changes for learner addition, promotion and removal. The temporary voting set contains both the source and the replacement, so each transition has overlapping majorities. The partition leader checks durable progress on the replacement and a majority of the surviving voters before removal. The controller publishes the new placement only after a surviving partition leader reports the committed membership. It removes the departing controller voter after all partition moves finish and records the retired broker ID in the controller log. Recovery resumes active plans and reinstalls snapshots when a replacement needs a compacted prefix.
 
 An operator-requested rebalance uses the same relocation state machine. It
 balances replica counts across committed controller voters and retains each
@@ -99,18 +92,7 @@ explicit transfer after checking that the target is a caught-up voter. The
 caller observes the requested leader before success. A committed rebalance
 resumes after restart or a destination outage.
 
-Future peer inventory changes must bind the node ID, advertised endpoints and
-certificate pin in committed controller state before the node joins as a
-learner. The live transport needs to apply the same authorization to incoming
-and outgoing connections. Certificate issuance and rotation policy remain
-operator decisions.
-
-For singleton conversion, quiesce client traffic, sync and capture the durable boundaries and cluster metadata. Add two peers, keep the original cluster ID, topic IDs and Kafka offsets, and copy partition and coordinator state including producer retry state. Change the controller and data memberships through persisted transitions. Resume traffic once safety checks show the target configuration is durable. Persist the migration phase and fence normal singleton startup after conversion starts. An interruption must resume from the last persisted phase. Import needs to seed the retained offset base and producer retry checkpoints
-when singleton retention has already removed earlier records. The importer
-also needs to reserve the singleton producer ID range because cluster
-allocation encodes the originating broker ID.
-
-An offline copy is useful for rollback only via an explicit recovery procedure that ensures the previous volume and converted cluster are never active together.
+For singleton conversion, stop clients and the source broker and import into fresh voter volumes. The operator supplies the destination cluster ID. The importer locks both volumes, records a durable source fence and builds Raft files in a staging directory. It publishes the synced directory before a target can start. Retried commands rebuild unpublished work or finish marking published work ready. The initial entries record the original topic IDs, retained offset bases, producer retry state and group commits. The controller puts new producer IDs above the singleton's reserved range. The target bootstrap voters all receive the same committed prefix before startup. See the [migration and recovery procedure](../README.md#migrate-single-node-data-to-a-cluster).
 
 ## Memory and overload
 

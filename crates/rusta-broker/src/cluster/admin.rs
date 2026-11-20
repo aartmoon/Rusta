@@ -29,6 +29,10 @@ pub enum Command {
     Rebalance {
         id: Uuid,
     },
+    PeerInventory,
+    StagePeer {
+        spec: String,
+    },
     RelocationStatus,
     Transfer {
         topic: String,
@@ -129,6 +133,11 @@ async fn write<T: Serialize>(stream: &mut UnixStream, message: &T, limit: usize)
 
 async fn execute(cluster: &Arc<Cluster>, command: Command) -> Result<Value> {
     match command {
+        Command::PeerInventory => cluster.call(|engine| Ok(engine.peer_inventory())).await,
+        Command::StagePeer { spec } => {
+            let id = cluster.stage_peer(spec).await?;
+            Ok(json!({ "node_id": id, "result": "staged" }))
+        }
         Command::RelocationStatus => cluster.call(|engine| Ok(engine.relocation_status())).await,
         Command::Rebalance { id } => {
             let request = cluster

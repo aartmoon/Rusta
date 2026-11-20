@@ -5,6 +5,7 @@ cd "$(dirname "$0")/../.."
 export RUSTA_PORT_1="${RUSTA_PORT_1:-19392}"
 export RUSTA_PORT_2="${RUSTA_PORT_2:-19393}"
 export RUSTA_PORT_3="${RUSTA_PORT_3:-19394}"
+export RUSTA_CLUSTER_SNAPSHOT_INTERVAL=2
 scratch="$(mktemp -d /tmp/rusta-groups.XXXXXXXX)"
 scratch="$(cd "$scratch" && pwd -P)"
 export RUSTA_CLUSTER_PKI="$scratch/pki"
@@ -71,5 +72,5 @@ java_test GroupSmoke verify "$nodes"
 java_test GroupWireSmoke verify "$nodes" "$scratch"
 java_test SpringSmoke verify-cluster "$nodes"
 docker run --rm --network "${project}_default" --mount "type=bind,src=$scratch,dst=/smoke,readonly" \
-    eclipse-temurin:21-jdk-noble java -Dorg.slf4j.simpleLogger.defaultLogLevel=error \
+    eclipse-temurin:21-jdk-noble@sha256:bc12ebd88ffa6dda0092940e179365b05aef8d813b867f9df5a1f168c9a44feb java -Dorg.slf4j.simpleLogger.defaultLogLevel=error \
     -cp '/smoke:/smoke/deps/*' GroupWireSmoke verify broker1:29092,broker2:29092,broker3:29092 /smoke

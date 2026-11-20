@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,7 +15,11 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::protocol::{Error, lookup_from, topic_config};
+use crate::{
+    group_protocol,
+    protocol::{Error, lookup_from, topic_config},
+    topic_admin,
+};
 
 use super::{
     Cluster,
@@ -41,6 +46,26 @@ pub(super) async fn reply<T>(receiver: oneshot::Receiver<Result<T, Error>>) -> R
         .map_err(|_| Error::Storage)?
 }
 
+enum ProduceOutcome {
+    Complete(Result<i64, Error>),
+    Pending(Write, Instant),
+}
+
+async fn write_result(write: Write, deadline: Instant) -> Result<i64, Error> {
+    let answer = async {
+        match write {
+            Write::Existing(offset, barrier) => {
+                barrier.await.map_err(|_| Error::Storage)??;
+                Ok(offset)
+            }
+            Write::Pending(receiver) => receiver.await.map_err(|_| Error::Storage)?,
+        }
+    };
+    timeout_at(deadline, answer)
+        .await
+        .map_err(|_| Error::RequestTimedOut)?
+}
+
 impl Cluster {
     pub async fn request(
         self: &Arc<Self>,
@@ -61,7 +86,20 @@ impl Cluster {
                 encode(head, if unsupported { 0 } else { version }, &versions)?
             }
             Request::CreateTopics(request) => {
-                encode(head, version, &self.create_topics(request).await?)?
+                let response =
+                    topic_admin::create_response(self.create_topics(request).await?, version);
+                encode(head, version, &response)?
+            }
+            Request::DeleteTopics(request) => {
+                encode(head, version, &self.delete_topics(request, version).await?)?
+            }
+            Request::DescribeConfigs(request) => encode(
+                head,
+                version,
+                &self.describe_configs(request, version).await?,
+            )?,
+            Request::IncrementalAlterConfigs(request) => {
+                encode(head, version, &self.alter_configs(request).await?)?
             }
             Request::Metadata(request) => {
                 let response = self
@@ -72,8 +110,21 @@ impl Cluster {
             Request::InitProducerId(request) => {
                 let mut response = messages::InitProducerIdResponse::default();
                 if request.transactional_id.is_none() {
-                    response.producer_id = ProducerId(self.call(Engine::allocate_producer).await?);
-                    response.producer_epoch = 0;
+                    let producer = self
+                        .call(|engine| {
+                            if engine.voters().contains(&engine.node_id()) {
+                                engine.allocate_producer().map(Some)
+                            } else {
+                                Ok(None)
+                            }
+                        })
+                        .await?;
+                    if let Some(id) = producer {
+                        response.producer_id = ProducerId(id);
+                        response.producer_epoch = 0;
+                    } else {
+                        response.error_code = Error::BrokerNotAvailable as i16;
+                    }
                 } else {
                     response.error_code = Error::UnsupportedVersion as i16;
                 }
@@ -96,18 +147,23 @@ impl Cluster {
                 &self.find_coordinator(request, version, internal).await?,
             )?,
             Request::JoinGroup(request) => {
-                let mut response = self
+                let response = self
                     .join_group(request, head.client_id.clone(), client_host)
                     .await?;
-                if version == 6 && response.protocol_name.is_none() {
-                    response.protocol_name = Some(StrBytes::default());
-                }
+                encode(
+                    head,
+                    version,
+                    &group_protocol::join_response(response, version),
+                )?
+            }
+            Request::SyncGroup(request) => {
+                let response =
+                    group_protocol::sync_response(self.sync_group(request).await?, version);
                 encode(head, version, &response)?
             }
-            Request::SyncGroup(request) => encode(head, version, &self.sync_group(request).await?)?,
             Request::Heartbeat(request) => encode(head, version, &self.heartbeat(request).await?)?,
             Request::LeaveGroup(request) => {
-                encode(head, version, &self.leave_group(request).await?)?
+                encode(head, version, &self.leave_group(request, version).await?)?
             }
             Request::OffsetCommit(request) => {
                 encode(head, version, &self.offset_commit(request).await?)?
@@ -153,14 +209,13 @@ impl Cluster {
                         if !(1..=size).contains(&factor) || !topic.assignments.is_empty() {
                             return Err(Error::InvalidReplicationFactor);
                         }
-                        let mut cfg = topic_config(
+                        let cfg = topic_config(
                             &topic.with_replication_factor(1),
                             engine.cap().saturating_sub(engine.partitions()),
                         )?;
                         if cfg.allow_weak_acks {
                             return Err(Error::InvalidConfig);
                         }
-                        cfg.retention_ms.get_or_insert(-1);
                         Ok((cfg, factor))
                     })();
                     Ok(outcome)
@@ -217,31 +272,54 @@ impl Cluster {
         } else {
             None
         };
-        let mut responses = Vec::new();
+        let repeated_partition = {
+            let mut seen = HashSet::new();
+            request.topic_data.iter().any(|topic| {
+                topic
+                    .partition_data
+                    .iter()
+                    .any(|part| !seen.insert((&topic.name, part.index)))
+            })
+        };
+        // Submit independent partition batches before awaiting their quorum replies.
+        // Preserve the request order when the same partition appears more than once.
+        let mut proposed_topics = Vec::new();
         for topic in request.topic_data {
             let mut partitions = Vec::new();
             for part in topic.partition_data {
                 let index = part.index;
-                let mut result = PartitionProduceResponse::default().with_index(index);
-                let outcome = if let Some(error) = request_error {
+                let proposed = if let Some(error) = request_error {
                     Err(error)
                 } else if let Some(records) = part.records {
                     let name = topic.name.0.as_str().to_owned();
-                    let proposed = self
-                        .call(move |engine| match engine.topic_key(&name, index) {
-                            Ok(key) => engine.produce(key, records),
-                            Err(error) => Ok(Err(error)),
-                        })
-                        .await?;
-                    match proposed {
-                        Ok(Write::Existing(offset, barrier)) => {
-                            reply(barrier).await.map(|()| offset)
-                        }
-                        Ok(Write::Pending(receiver)) => reply(receiver).await,
-                        Err(error) => Err(error),
-                    }
+                    self.call(move |engine| match engine.topic_key(&name, index) {
+                        Ok(key) => engine.produce(key, records),
+                        Err(error) => Ok(Err(error)),
+                    })
+                    .await?
                 } else {
                     Err(Error::InvalidRecord)
+                };
+                let outcome = match proposed {
+                    Ok(write) if repeated_partition => ProduceOutcome::Complete(
+                        write_result(write, Instant::now() + DEADLINE).await,
+                    ),
+                    Ok(write) => ProduceOutcome::Pending(write, Instant::now() + DEADLINE),
+                    Err(error) => ProduceOutcome::Complete(Err(error)),
+                };
+                partitions.push((index, outcome));
+            }
+            proposed_topics.push((topic.name, partitions));
+        }
+
+        let mut responses = Vec::new();
+        for (name, proposed) in proposed_topics {
+            let mut partitions = Vec::new();
+            for (index, outcome) in proposed {
+                let mut result = PartitionProduceResponse::default().with_index(index);
+                let outcome = match outcome {
+                    ProduceOutcome::Complete(completed) => completed,
+                    ProduceOutcome::Pending(write, deadline) => write_result(write, deadline).await,
                 };
                 match outcome {
                     Ok(offset) => {
@@ -254,7 +332,7 @@ impl Cluster {
             }
             responses.push(
                 TopicProduceResponse::default()
-                    .with_name(topic.name)
+                    .with_name(name)
                     .with_partition_responses(partitions),
             );
         }
@@ -524,13 +602,18 @@ impl Cluster {
                                 return Ok((node.epoch(), log.committed().next_offset));
                             }
                             let physical_start = log.start().next_offset;
-                            let mut value = (-1, physical_start);
-                            log.visit_batches(physical_start, &mut Vec::new(), |entry, _| {
-                                if entry.term > part.leader_epoch as u64 {
+                            let previous_epoch = node
+                                .compacted_data_epoch()
+                                .filter(|&epoch| epoch <= part.leader_epoch)
+                                .unwrap_or(-1);
+                            let mut value = (previous_epoch, physical_start);
+                            log.visit_batches(physical_start, &mut Vec::new(), |entry, bytes| {
+                                let epoch = super::disk::batch_epoch(bytes);
+                                if epoch > part.leader_epoch {
                                     return Ok(false);
                                 }
                                 value = (
-                                    entry.term as i32,
+                                    epoch,
                                     entry.position.next_offset + i64::from(entry.record_count),
                                 );
                                 Ok(true)

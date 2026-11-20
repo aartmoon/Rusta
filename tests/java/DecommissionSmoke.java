@@ -44,20 +44,37 @@ public final class DecommissionSmoke {
                     GroupSmoke.TIMEOUT);
             }
             var topic = waitForPlacement(endpoint, INITIAL, 0);
-            int leader = topic.partitions().stream().filter(p -> p.partitionIndex() == 0).findFirst().orElseThrow().leaderId();
-            GroupSmoke.check(INITIAL.contains(leader), "unexpected initial partition leader");
-            Files.writeString(scratch.resolve("source"), Integer.toString(leader));
+            Files.writeString(scratch.resolve("topic-id"), topic.topicId().toString());
+            var metadata = (MetadataResponse) Smoke.exchange(endpoint, MetadataRequest.Builder.allTopics().build((short) 12), 1);
+            Files.writeString(scratch.resolve("initial-controller"), Integer.toString(metadata.data().controllerId()));
         } else if (mode.equals("traffic")) {
-            try (var producer = new KafkaProducer<String, String>(GroupSmoke.producer(endpoint))) {
+            try (var producer = new KafkaProducer<String, String>(GroupSmoke.producer(endpoint));
+                 var consumer = new KafkaConsumer<String, String>(GroupSmoke.consumer(endpoint, "drain-readback"))) {
                 long deadline = System.nanoTime() + Duration.ofSeconds(80).toNanos();
                 int next = 1;
+                long read = 0;
+                var partition = new TopicPartition(TOPIC, 0);
+                consumer.assign(List.of(partition));
+                consumer.seek(partition, 0);
                 while (!Files.exists(scratch.resolve("stop")) && System.nanoTime() < deadline) {
                     send(producer, 0, next++);
+                    for (var record : consumer.poll(Duration.ofMillis(5))) {
+                        GroupSmoke.check(record.offset() == read && value(0, read).equals(record.value()),
+                            "concurrent Fetch returned a gap or different record");
+                        read++;
+                    }
                     if (next == 2) Files.writeString(scratch.resolve("ready"), "ready");
                 }
                 GroupSmoke.check(next > 2 && Files.exists(scratch.resolve("stop")), "missing concurrent writes");
+                GroupSmoke.check(read >= 3, "missing concurrent reads");
                 Files.writeString(scratch.resolve("committed"), Integer.toString(next));
             }
+        } else if (mode.equals("before-decommission")) {
+            var topic = waitForPlacement(endpoint, INITIAL, 0);
+            checkTopicId(topic, scratch);
+            checkCommit(endpoint);
+            int leader = topic.partitions().stream().filter(p -> p.partitionIndex() == 0).findFirst().orElseThrow().leaderId();
+            Files.writeString(scratch.resolve("source"), Integer.toString(leader));
         } else if (mode.equals("pending")) {
             var request = MetadataRequest.Builder.allTopics().build((short) 12);
             long deadline = System.nanoTime() + Duration.ofSeconds(2).toNanos();
@@ -88,14 +105,9 @@ public final class DecommissionSmoke {
             survivors.remove(Integer.parseInt(Files.readString(scratch.resolve("source"))));
             survivors.add(4);
             int stopped = mode.equals("quorum") ? Integer.parseInt(Files.readString(scratch.resolve("stopped")).trim()) : 0;
-            waitForPlacement(endpoint, survivors, stopped);
+            checkTopicId(waitForPlacement(endpoint, survivors, stopped), scratch);
             if (!mode.equals("placement")) {
-                var groupPartition = new TopicPartition(TOPIC, 0);
-                try (var consumer = new KafkaConsumer<String, String>(GroupSmoke.consumer(endpoint, "drain-group"))) {
-                    var offset = consumer.committed(Set.of(groupPartition), GroupSmoke.TIMEOUT).get(groupPartition);
-                    GroupSmoke.check(offset != null && offset.offset() == 1 && "relocate".equals(offset.metadata()),
-                        "consumer commit was lost during shard relocation");
-                }
+                checkCommit(endpoint);
                 int end = Integer.parseInt(Files.readString(scratch.resolve("committed")));
                 verify(endpoint, 0, end);
                 for (int partition = 1; partition < PARTITIONS; partition++) {
@@ -111,6 +123,20 @@ public final class DecommissionSmoke {
             }
         }
         System.out.println("Decommission " + mode + " passed");
+    }
+
+    private static void checkTopicId(MetadataResponseTopic topic, Path scratch) throws Exception {
+        GroupSmoke.check(topic.topicId().toString().equals(Files.readString(scratch.resolve("topic-id"))),
+            "topic ID changed during membership change");
+    }
+
+    private static void checkCommit(String endpoint) {
+        var partition = new TopicPartition(TOPIC, 0);
+        try (var consumer = new KafkaConsumer<String, String>(GroupSmoke.consumer(endpoint, "drain-group"))) {
+            var offset = consumer.committed(Set.of(partition), GroupSmoke.TIMEOUT).get(partition);
+            GroupSmoke.check(offset != null && offset.offset() == 1 && "relocate".equals(offset.metadata()),
+                "consumer commit was lost during membership change");
+        }
     }
 
     private static void send(KafkaProducer<String, String> producer, int partition, long offset) throws Exception {

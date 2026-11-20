@@ -2,25 +2,28 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use protobuf::Message as ProtoMessage;
-use raft::eraftpb::Message;
+use raft::eraftpb::{Message, MessageType};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    runtime::Handle,
     sync::{OwnedSemaphorePermit, Semaphore, mpsc},
     time::{sleep, timeout},
 };
 use tokio_rustls::{
     TlsAcceptor, TlsConnector,
+    client::TlsStream,
     rustls::{
         ClientConfig, RootCertStore, ServerConfig,
-        pki_types::{CertificateDer, ServerName},
-        server::WebPkiClientVerifier,
+        client::{WebPkiServerVerifier, danger::ServerCertVerifier},
+        pki_types::{CertificateDer, ServerName, UnixTime},
+        server::{WebPkiClientVerifier, danger::ClientCertVerifier},
     },
 };
 use uuid::Uuid;
@@ -36,6 +39,7 @@ pub enum Packet {
     Join,
     Drain,
     Moved(Uuid, Movement),
+    PeerReady(Bytes),
 }
 
 pub struct Queued {
@@ -52,11 +56,17 @@ impl Queued {
     pub fn send(queue: &mpsc::Sender<Self>, budget: &Arc<Semaphore>, packet: Packet) {
         let size = match &packet {
             Packet::Raft(_, message) => message.compute_size() as usize + GROUP,
-            Packet::Leaders(report) => report.len(),
+            Packet::Leaders(report) | Packet::PeerReady(report) => report.len(),
             Packet::Join | Packet::Drain => 0,
             Packet::Moved(..) => MOVE,
         } + HEADER;
-        if size <= MAX_PACKET
+        let limit = if matches!(&packet, Packet::Raft(_, message) if message.get_msg_type() == MessageType::MsgSnapshot)
+        {
+            MAX_SNAPSHOT_FRAME
+        } else {
+            MAX_PACKET
+        };
+        if size <= limit
             && let Ok(permit) = budget.clone().try_acquire_many_owned(size as u32)
         {
             let _ = queue.try_send(Self {
@@ -68,7 +78,7 @@ impl Queued {
 }
 
 pub type Senders = HashMap<u64, mpsc::Sender<Queued>>;
-type Receivers = HashMap<u64, mpsc::Receiver<Queued>>;
+type Pins = HashMap<u64, CertificateDer<'static>>;
 const MAX_PACKET: usize = 2 * 1024 * 1024 + 65536;
 const HEADER: usize = 49;
 const GROUP: usize = 20;
@@ -76,11 +86,47 @@ const LEGACY_MOVE: usize = GROUP + 16;
 const MOVE: usize = LEGACY_MOVE + 16;
 const REPORT_ITEM: usize = GROUP + 4;
 const DEADLINE: Duration = Duration::from_secs(2);
+const READY_ITEM: usize = 33;
+const SNAPSHOT_FRAME: u8 = 8;
+const MAX_SNAPSHOT_FRAME: usize = super::checkpoint::MAX_SNAPSHOT as usize + 16 * 1024;
+const SNAPSHOT_CHUNK: usize = 256 * 1024;
+const SNAPSHOT_RATE: f64 = (8 * 1024 * 1024) as f64;
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(15);
+
+pub fn peer_fingerprint(pin: &CertificateDer<'static>, spec: &str) -> [u8; 32] {
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    digest.update(spec.as_bytes());
+    digest.update(&[0]);
+    digest.update(pin.as_ref());
+    digest.finish().as_ref().try_into().expect("SHA256 digest")
+}
 
 pub struct Tls {
     connect: TlsConnector,
     accept: TlsAcceptor,
-    identity: Arc<HashMap<u64, CertificateDer<'static>>>,
+    identity: Pins,
+    validators: Validators,
+}
+
+struct Validators {
+    client_cert: Arc<dyn ClientCertVerifier>,
+    server_cert: Arc<WebPkiServerVerifier>,
+}
+
+impl Validators {
+    fn verify(&self, peer: &Peer, certificate: &CertificateDer<'static>) -> Result<()> {
+        let time = UnixTime::now();
+        self.client_cert
+            .verify_client_cert(certificate, &[], time)?;
+        self.server_cert.verify_server_cert(
+            certificate,
+            &[],
+            &ServerName::try_from(peer.dns.as_str())?,
+            &[],
+            time,
+        )?;
+        Ok(())
+    }
 }
 
 impl Tls {
@@ -92,10 +138,7 @@ impl Tls {
         }
         let mut identity = HashMap::new();
         for &id in settings.peers.keys() {
-            let leaf = certificates(&path.join(format!("node-{id}.pem")))?
-                .into_iter()
-                .next()
-                .context("empty peer certificate")?;
+            let leaf = load_pin(path, id)?;
             ensure!(
                 !identity.values().any(|existing| existing == &leaf),
                 "peer certificates must be unique"
@@ -106,9 +149,13 @@ impl Tls {
         let key =
             rustls_pemfile::private_key(&mut BufReader::new(File::open(path.join("key.pem"))?))?
                 .context("missing node private key")?;
-        let verifier = WebPkiClientVerifier::builder(Arc::new(roots.clone())).build()?;
+        let roots = Arc::new(roots);
+        let validators = Validators {
+            client_cert: WebPkiClientVerifier::builder(roots.clone()).build()?,
+            server_cert: WebPkiServerVerifier::builder(roots.clone()).build()?,
+        };
         let accept = ServerConfig::builder()
-            .with_client_cert_verifier(verifier)
+            .with_client_cert_verifier(validators.client_cert.clone())
             .with_single_cert(own.clone(), key.clone_key())?;
         let connect = ClientConfig::builder()
             .with_root_certificates(roots)
@@ -116,9 +163,31 @@ impl Tls {
         Ok(Self {
             connect: TlsConnector::from(Arc::new(connect)),
             accept: TlsAcceptor::from(Arc::new(accept)),
-            identity: Arc::new(identity),
+            identity,
+            validators,
         })
     }
+
+    pub fn validate_inventory(&self, settings: &Settings) -> Result<()> {
+        for (&id, peer) in &settings.peers {
+            self.validators
+                .verify(peer, &self.identity[&id])
+                .with_context(|| format!("validate certificate for node {id}"))?;
+        }
+        Ok(())
+    }
+}
+
+pub fn load_pin(path: &Path, id: u64) -> Result<CertificateDer<'static>> {
+    certificates(&path.join(format!("node-{id}.pem")))?
+        .into_iter()
+        .next()
+        .context("empty peer certificate")
+}
+
+pub fn validate_name(name: &str) -> Result<()> {
+    ServerName::try_from(name)?;
+    Ok(())
 }
 
 fn certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
@@ -127,53 +196,187 @@ fn certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
         .with_context(|| format!("read certificates in {}", path.display()))
 }
 
-pub fn routes(settings: &Settings) -> (Senders, Receivers) {
-    let mut outbound = Senders::new();
-    let mut receiver = Receivers::new();
-    for &id in settings.peers.keys().filter(|id| **id != settings.id) {
-        let (sender, messages) = mpsc::channel(16);
-        outbound.insert(id, sender);
-        receiver.insert(id, messages);
-    }
-    (outbound, receiver)
+pub struct Routes {
+    connect: TlsConnector,
+    accept: TlsAcceptor,
+    identity: Arc<RwLock<Pins>>,
+    capacity: Arc<Semaphore>,
+    cluster: Uuid,
+    voter_mask: [u8; 32],
+    validators: Validators,
 }
 
-pub async fn start(
-    settings: Settings,
-    tls: Tls,
-    receivers: Receivers,
-    cluster: Arc<Cluster>,
-) -> Result<()> {
-    let listener = TcpListener::bind(settings.bind).await?;
-    for (id, messages) in receivers {
-        tokio::spawn(outbound(
-            settings.cluster,
-            settings.voter_mask(),
-            settings.peers[&id].clone(),
-            tls.identity[&id].clone(),
-            tls.connect.clone(),
+impl Routes {
+    pub fn new(settings: &Settings, tls: Tls) -> Self {
+        Self {
+            connect: tls.connect,
+            accept: tls.accept,
+            identity: Arc::new(RwLock::new(tls.identity)),
+            capacity: Arc::new(Semaphore::new(settings.peers.len() + 4)),
+            cluster: settings.cluster,
+            voter_mask: settings.voter_mask(),
+            validators: tls.validators,
+        }
+    }
+
+    pub fn connect_all(&self, settings: &Settings) -> Senders {
+        let pins = self.identity.read().expect("peer pins");
+        let runtime = Handle::current();
+        settings
+            .peers
+            .iter()
+            .filter(|(id, _)| **id != settings.id)
+            .map(|(&id, peer)| {
+                (
+                    id,
+                    self.connect_peer(peer.clone(), pins[&id].clone(), &runtime),
+                )
+            })
+            .collect()
+    }
+
+    pub fn check_pin(&self, id: u64, peer: &Peer, pinned: &CertificateDer<'static>) -> Result<()> {
+        self.validators
+            .verify(peer, pinned)
+            .context("validate peer certificate")?;
+        let pins = self.identity.read().expect("peer pins");
+        ensure!(
+            pins.get(&id).is_none_or(|existing| existing == pinned),
+            "configured peer certificate has changed"
+        );
+        ensure!(
+            !pins
+                .iter()
+                .any(|(&member, existing)| member != id && existing == pinned),
+            "peer certificates must be unique"
+        );
+        Ok(())
+    }
+
+    pub fn add(
+        &self,
+        id: u64,
+        peer: Peer,
+        pinned: CertificateDer<'static>,
+        runtime: &Handle,
+    ) -> mpsc::Sender<Queued> {
+        self.identity
+            .write()
+            .expect("peer pins")
+            .insert(id, pinned.clone());
+        self.capacity.add_permits(1);
+        self.connect_peer(peer, pinned, runtime)
+    }
+
+    fn connect_peer(
+        &self,
+        peer: Peer,
+        pinned: CertificateDer<'static>,
+        runtime: &Handle,
+    ) -> mpsc::Sender<Queued> {
+        let (sender, messages) = mpsc::channel(16);
+        runtime.spawn(outbound(
+            self.cluster,
+            self.voter_mask,
+            peer,
+            pinned,
+            self.connect.clone(),
             messages,
         ));
+        sender
     }
-    tokio::spawn(async move {
-        let capacity = Arc::new(Semaphore::new(settings.peers.len() + 4));
-        let bytes = Arc::new(Semaphore::new(16 * 1024 * 1024));
-        while let Ok((socket, _)) = listener.accept().await {
-            let Ok(permit) = capacity.clone().try_acquire_owned() else {
-                continue;
-            };
-            let certificates = tls.identity.clone();
-            let tls = tls.accept.clone();
-            let cluster = cluster.clone();
-            let peer_identity = (settings.cluster, settings.voter_mask(), settings.id);
-            let bytes = bytes.clone();
-            tokio::spawn(async move {
-                let _permit = permit;
-                let _ = inbound(cluster, peer_identity, tls, certificates, socket, bytes).await;
-            });
+
+    pub async fn listen(&self, settings: &Settings, cluster: Arc<Cluster>) -> Result<()> {
+        let listener = TcpListener::bind(settings.bind).await?;
+        let peer_identity = (self.cluster, self.voter_mask, settings.id);
+        let capacity = self.capacity.clone();
+        let pins = self.identity.clone();
+        let accept = self.accept.clone();
+        tokio::spawn(async move {
+            let bytes = Arc::new(Semaphore::new(16 * 1024 * 1024));
+            while let Ok((socket, _)) = listener.accept().await {
+                let Ok(permit) = capacity.clone().try_acquire_owned() else {
+                    continue;
+                };
+                let tls = accept.clone();
+                let pins = pins.clone();
+                let cluster = cluster.clone();
+                let bytes = bytes.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let _ = inbound(cluster, peer_identity, tls, pins, socket, bytes).await;
+                });
+            }
+        });
+        Ok(())
+    }
+}
+
+struct Remote {
+    cluster: Uuid,
+    voter_mask: [u8; 32],
+    peer: Peer,
+    pinned: CertificateDer<'static>,
+    tls: TlsConnector,
+}
+
+impl Remote {
+    async fn connect(&self) -> Result<TlsStream<TcpStream>> {
+        let socket = timeout(DEADLINE, TcpStream::connect(&self.peer.raft)).await??;
+        socket.set_nodelay(true)?;
+        let name = ServerName::try_from(self.peer.dns.clone())?;
+        let socket = timeout(DEADLINE, self.tls.connect(name, socket)).await??;
+        let leaf = socket
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|chain| chain.first());
+        ensure!(
+            leaf == Some(&self.pinned),
+            "unexpected remote node certificate"
+        );
+        Ok(socket)
+    }
+
+    fn frame_header(
+        &self,
+        kind: u8,
+        group: Option<GroupId>,
+        len: usize,
+    ) -> Result<([u8; 4 + HEADER + GROUP], usize)> {
+        let header_size = HEADER + group.map_or(0, |_| GROUP);
+        let size = header_size + len;
+        let limit = if kind == SNAPSHOT_FRAME {
+            MAX_SNAPSHOT_FRAME
+        } else {
+            MAX_PACKET
+        };
+        ensure!(size <= limit, "Raft frame too large");
+        let mut header = [0; 4 + HEADER + GROUP];
+        let mut fields = &mut header[..];
+        fields.put_u32(size as u32);
+        fields.put_u8(kind);
+        fields.put_slice(self.cluster.as_bytes());
+        fields.put_slice(&self.voter_mask);
+        if let Some(key) = group {
+            fields.put_slice(key.topic.as_bytes());
+            fields.put_u32(key.partition);
         }
-    });
-    Ok(())
+        Ok((header, 4 + header_size))
+    }
+
+    async fn send_snapshot(&self, key: GroupId, message: &Message) -> Result<()> {
+        let mut socket = self.connect().await?;
+        let data = message.write_to_bytes()?;
+        let (header, len) = self.frame_header(SNAPSHOT_FRAME, Some(key), data.len())?;
+        socket.write_all(&header[..len]).await?;
+        for chunk in data.chunks(SNAPSHOT_CHUNK) {
+            timeout(DEADLINE, socket.write_all(chunk)).await??;
+            socket.flush().await?;
+            sleep(Duration::from_secs_f64(chunk.len() as f64 / SNAPSHOT_RATE)).await;
+        }
+        Ok(())
+    }
 }
 
 async fn outbound(
@@ -184,68 +387,69 @@ async fn outbound(
     tls: TlsConnector,
     mut messages: mpsc::Receiver<Queued>,
 ) {
-    loop {
-        let Some(first) = messages.recv().await else {
-            return;
-        };
-        let result = async {
-            let socket = timeout(DEADLINE, TcpStream::connect(&peer.raft)).await??;
-            socket.set_nodelay(true)?;
-            let name = ServerName::try_from(peer.dns.clone())?;
-            let mut socket = timeout(DEADLINE, tls.connect(name, socket)).await??;
-            let leaf = socket
-                .get_ref()
-                .1
-                .peer_certificates()
-                .and_then(|chain| chain.first());
-            ensure!(leaf == Some(&pinned), "unexpected remote node certificate");
-            let mut queued = first;
-            loop {
-                let (kind, group, data): (_, _, Bytes) = match &queued.packet {
-                    Packet::Raft(key, message) => (2, Some(*key), message.write_to_bytes()?.into()),
-                    Packet::Leaders(data) => (3, None, data.clone()),
-                    Packet::Join => (4, None, Bytes::new()),
-                    Packet::Drain => (5, None, Bytes::new()),
-                    Packet::Moved(id, movement) => {
-                        let mut body = BytesMut::with_capacity(MOVE);
-                        body.extend_from_slice(movement.key.topic.as_bytes());
-                        body.put_u32(movement.key.partition);
-                        body.put_u64(movement.from);
-                        body.put_u64(movement.to);
-                        body.extend_from_slice(id.as_bytes());
-                        (6, None, body.freeze())
-                    }
-                };
-                let size = HEADER + data.len() + group.map_or(0, |_| GROUP);
-                ensure!(size <= MAX_PACKET, "Raft frame too large");
-                timeout(DEADLINE, async {
-                    socket.write_u32(size as u32).await?;
-                    socket.write_u8(kind).await?;
-                    socket.write_all(cluster.as_bytes()).await?;
-                    socket.write_all(&voter_mask).await?;
-                    if let Some(key) = group {
-                        socket.write_all(key.topic.as_bytes()).await?;
-                        socket.write_u32(key.partition).await?;
-                    }
-                    socket.write_all(&data).await?;
-                    socket.flush().await
-                })
-                .await??;
-                drop(queued);
-                let Some(next) = messages.recv().await else {
-                    return Ok::<_, anyhow::Error>(());
-                };
-                queued = next;
+    let remote = Arc::new(Remote {
+        cluster,
+        voter_mask,
+        peer,
+        pinned,
+        tls,
+    });
+    let snapshots = Arc::new(Semaphore::new(1));
+    let mut socket = None;
+    while let Some(queued) = messages.recv().await {
+        if matches!(&queued.packet, Packet::Raft(_, message) if message.get_msg_type() == MessageType::MsgSnapshot)
+        {
+            if let Ok(slot) = snapshots.clone().try_acquire_owned() {
+                let remote = remote.clone();
+                tokio::spawn(async move {
+                    let _slot = slot;
+                    let Packet::Raft(key, message) = &queued.packet else {
+                        unreachable!()
+                    };
+                    let _ = timeout(SNAPSHOT_TIMEOUT, remote.send_snapshot(*key, message)).await;
+                });
+            }
+            continue;
+        }
+        if socket.is_none() {
+            match remote.connect().await {
+                Ok(connection) => socket = Some(connection),
+                Err(_) => {
+                    sleep(Duration::from_millis(75)).await;
+                    continue;
+                }
             }
         }
+        let connection = socket.as_mut().expect("connected");
+        let result = timeout(DEADLINE, async {
+            let (kind, group, data): (_, _, Bytes) = match &queued.packet {
+                Packet::Raft(key, message) => (2, Some(*key), message.write_to_bytes()?.into()),
+                Packet::Leaders(data) => (3, None, data.clone()),
+                Packet::Join => (4, None, Bytes::new()),
+                Packet::Drain => (5, None, Bytes::new()),
+                Packet::PeerReady(data) => (7, None, data.clone()),
+                Packet::Moved(id, movement) => {
+                    let mut body = BytesMut::with_capacity(MOVE);
+                    body.extend_from_slice(movement.key.topic.as_bytes());
+                    body.put_u32(movement.key.partition);
+                    body.put_u64(movement.from);
+                    body.put_u64(movement.to);
+                    body.extend_from_slice(id.as_bytes());
+                    (6, None, body.freeze())
+                }
+            };
+            let (header, len) = remote.frame_header(kind, group, data.len())?;
+            connection
+                .write_all_buf(&mut Buf::chain(&header[..len], data))
+                .await?;
+            connection.flush().await?;
+            Ok::<_, anyhow::Error>(())
+        })
         .await;
-        if result.is_ok() {
-            return;
+        if !matches!(result, Ok(Ok(()))) {
+            socket = None;
+            sleep(Duration::from_millis(75)).await;
         }
-        if messages.is_closed() {
-            return;
-        }
-        sleep(Duration::from_millis(75)).await;
     }
 }
 
@@ -253,7 +457,7 @@ async fn inbound(
     cluster: Arc<Cluster>,
     (cluster_id, voter_mask, local): (Uuid, [u8; 32], u64),
     tls: TlsAcceptor,
-    pins: Arc<HashMap<u64, CertificateDer<'static>>>,
+    pins: Arc<RwLock<Pins>>,
     socket: TcpStream,
     bytes: Arc<Semaphore>,
 ) -> Result<()> {
@@ -266,6 +470,8 @@ async fn inbound(
         .and_then(|chain| chain.first())
         .context("missing peer certificate")?;
     let source = pins
+        .read()
+        .expect("peer pins")
         .iter()
         .find(|(id, pinned)| **id != local && *pinned == leaf)
         .map(|(&id, _)| id)
@@ -273,19 +479,30 @@ async fn inbound(
     loop {
         let frame = timeout(Duration::from_secs(30), socket.read_u32()).await?? as usize;
         ensure!(
-            (HEADER..=MAX_PACKET).contains(&frame),
+            (HEADER..=MAX_SNAPSHOT_FRAME).contains(&frame),
+            "invalid Raft frame size"
+        );
+        let mut header = [0; HEADER];
+        timeout(DEADLINE, socket.read_exact(&mut header)).await??;
+        let kind = header[0];
+        ensure!(
+            &header[1..17] == cluster_id.as_bytes() && header[17..HEADER] == voter_mask,
+            "wrong cluster identity or voter roster"
+        );
+        ensure!(
+            frame <= MAX_PACKET || kind == SNAPSHOT_FRAME,
             "invalid Raft frame size"
         );
         let _permit = timeout(DEADLINE, bytes.acquire_many(frame as u32)).await??;
-        let mut data = vec![0; frame];
-        timeout(DEADLINE, socket.read_exact(&mut data)).await??;
-        ensure!(
-            &data[1..17] == cluster_id.as_bytes() && data[17..HEADER] == voter_mask,
-            "wrong cluster identity or voter roster"
-        );
-        let body = &data[HEADER..];
-        match data[0] {
-            2 => {
+        let mut data = vec![0; frame - HEADER];
+        if kind == SNAPSHOT_FRAME {
+            timeout(SNAPSHOT_TIMEOUT, read_snapshot_body(&mut socket, &mut data)).await??;
+        } else {
+            timeout(DEADLINE, socket.read_exact(&mut data)).await??;
+        }
+        let body = data.as_slice();
+        match kind {
+            2 | SNAPSHOT_FRAME => {
                 ensure!(body.len() >= GROUP, "missing Raft group identity");
                 let key = group_id(body)?;
                 let message: Message = ProtoMessage::parse_from_bytes(&body[GROUP..])?;
@@ -293,9 +510,16 @@ async fn inbound(
                     message.from == source && message.to == local,
                     "wrong authenticated Raft node ID"
                 );
+                ensure!(
+                    kind != SNAPSHOT_FRAME || message.get_msg_type() == MessageType::MsgSnapshot,
+                    "invalid snapshot frame"
+                );
                 cluster
                     .call(move |engine| engine.receive(key, message))
                     .await?;
+                if kind == SNAPSHOT_FRAME {
+                    return Ok(());
+                }
             }
             3 => {
                 let (items, tail) = body.as_chunks::<REPORT_ITEM>();
@@ -347,9 +571,42 @@ async fn inbound(
                     .call(move |engine| engine.receive_move(source, id, movement))
                     .await?;
             }
+            7 => {
+                let (items, tail) = body.as_chunks::<READY_ITEM>();
+                ensure!(
+                    tail.is_empty() && (1..=255).contains(&items.len()),
+                    "invalid peer readiness report"
+                );
+                let ready = items
+                    .iter()
+                    .map(|item| {
+                        let (&id, fingerprint) = item.split_first().expect("peer readiness item");
+                        (
+                            u64::from(id),
+                            fingerprint.try_into().expect("peer fingerprint"),
+                        )
+                    })
+                    .collect();
+                cluster
+                    .call(move |engine| {
+                        engine.receive_peer_ready(source, ready);
+                        Ok(())
+                    })
+                    .await?;
+            }
             _ => anyhow::bail!("unsupported peer protocol"),
         }
     }
+}
+
+async fn read_snapshot_body(
+    reader: &mut (impl AsyncRead + Unpin),
+    bytes: &mut [u8],
+) -> std::io::Result<()> {
+    for chunk in bytes.chunks_mut(SNAPSHOT_CHUNK) {
+        reader.read_exact(chunk).await?;
+    }
+    Ok(())
 }
 
 fn group_id(bytes: &[u8]) -> Result<GroupId> {
@@ -357,4 +614,52 @@ fn group_id(bytes: &[u8]) -> Result<GroupId> {
         topic: Uuid::from_slice(&bytes[..16])?,
         partition: u32::from_be_bytes(bytes[16..GROUP].try_into()?),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discarding_an_overflowing_frame_releases_its_byte_budget() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let budget = Arc::new(Semaphore::new(2 * HEADER));
+        Queued::send(&sender, &budget, Packet::Join);
+        Queued::send(&sender, &budget, Packet::Drain);
+        assert_eq!(budget.available_permits(), HEADER);
+        assert!(matches!(
+            receiver.try_recv().unwrap().into_packet(),
+            Packet::Join
+        ));
+        assert_eq!(budget.available_permits(), 2 * HEADER);
+        assert!(receiver.try_recv().is_err());
+
+        let small_budget = Arc::new(Semaphore::new(HEADER - 1));
+        Queued::send(&sender, &small_budget, Packet::Join);
+        assert_eq!(small_budget.available_permits(), HEADER - 1);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn interrupted_snapshot_stream_requires_a_complete_retry() {
+        let payload = vec![0x3c; MAX_PACKET + SNAPSHOT_CHUNK];
+        let mut received = vec![0; payload.len()];
+        let (mut writer, mut reader) = tokio::io::duplex(SNAPSHOT_CHUNK);
+        let truncated = &payload[..SNAPSHOT_CHUNK + 100];
+        let (_, result) = tokio::join!(
+            async move { writer.write_all(truncated).await.unwrap() },
+            read_snapshot_body(&mut reader, &mut received),
+        );
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        let (mut writer, mut reader) = tokio::io::duplex(SNAPSHOT_CHUNK);
+        let (_, result) = tokio::join!(
+            async { writer.write_all(&payload).await.unwrap() },
+            read_snapshot_body(&mut reader, &mut received),
+        );
+        result.unwrap();
+        assert_eq!(received, payload);
+    }
 }

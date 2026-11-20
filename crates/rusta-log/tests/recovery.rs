@@ -22,6 +22,98 @@ fn position(index: u64, offset: i64) -> Position {
     }
 }
 
+#[test]
+fn legacy_append_time_can_use_the_retention_activation_timestamp() -> io::Result<()> {
+    let dir = TempDir::new()?;
+    let mut log = PartitionLog::open(dir.path(), Options::default())?;
+    log.append_batch(1, 0, &batch(&[(100, 1)]))?;
+    let committed = log.commit()?;
+    drop(log);
+    let log = PartitionLog::open(dir.path(), Options::default())?;
+    let policy = |cutoff| Retention {
+        keep_since_ms: Some(cutoff),
+        max_bytes: None,
+    };
+    assert_eq!(
+        log.retention_boundary_with_legacy_time(log.start(), policy(120), Some(120))?,
+        log.start()
+    );
+    assert_eq!(
+        log.retention_boundary_with_legacy_time(log.start(), policy(121), Some(120))?,
+        committed
+    );
+    Ok(())
+}
+
+#[test]
+fn restart_at_snapshot_boundary_ignores_obsolete_segments() -> io::Result<()> {
+    let dir = TempDir::new()?;
+    let mut log = PartitionLog::open(dir.path(), options(256))?;
+    log.append_batch(1, 100, &batch(&[(100, 1)]))?;
+    log.commit()?;
+    log.append_internal(1, 0, b"uncommitted")?;
+    log.sync()?;
+    let obsolete = fs::read(file(dir.path(), 1))?;
+    assert!(log.install_snapshot_base(position(2, 0), 1).is_err());
+    let base = position(20, 10);
+    log.install_snapshot_base(base, 2)?;
+    assert_eq!(log.committed(), base);
+    drop(log);
+
+    // Simulate a crash after manifest publication and before segment cleanup.
+    fs::write(file(dir.path(), 1), obsolete)?;
+    let mut log = PartitionLog::open(dir.path(), options(256))?;
+    assert!(!file(dir.path(), 1).exists());
+    assert_eq!(log.start(), base);
+    assert_eq!(log.term(19)?, 2);
+    assert_eq!(
+        log.append_batch(3, 200, &batch(&[(200, 2)]))?.position,
+        base
+    );
+    assert_eq!(log.commit()?, position(21, 11));
+    Ok(())
+}
+
+#[test]
+#[ignore = "set RUSTA_TEST_FULL_DISK_DIR to a dedicated bounded filesystem"]
+fn full_disk_preserves_the_committed_prefix() -> io::Result<()> {
+    let filesystem = std::env::var_os("RUSTA_TEST_FULL_DISK_DIR")
+        .expect("set RUSTA_TEST_FULL_DISK_DIR to a dedicated tmpfs");
+    let dir = tempfile::tempdir_in(filesystem)?;
+    let root = dir.path().join("partition");
+    let mut log = PartitionLog::open(&root, Options::default())?;
+    log.append_batch(1, 100, &batch(&[(100, 1)]))?;
+    let committed = log.commit()?;
+    let fill_path = dir.path().join("fill");
+    let mut filler = fs::File::create(&fill_path)?;
+    let mut exhausted = false;
+    for _ in 0..16_384 {
+        if let Err(error) = filler.write_all(&[0; 4096]) {
+            assert_eq!(error.kind(), ErrorKind::StorageFull);
+            exhausted = true;
+            break;
+        }
+    }
+    assert!(exhausted, "test filesystem exceeded its 64 MiB budget");
+    let error = log.append_internal(1, 0, &[0; 8192]).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::StorageFull);
+    drop(log);
+    drop(filler);
+    fs::remove_file(fill_path)?;
+
+    let mut log = PartitionLog::open(&root, Options::default())?;
+    assert_eq!(log.committed(), committed);
+    assert_eq!(log.durable(), committed);
+    assert_eq!(log.end(), committed);
+    assert_eq!(log.batch_at(0, &mut Vec::new())?.unwrap().record_count, 1);
+    assert_eq!(
+        log.append_batch(2, 200, &batch(&[(200, 2)]))?.position,
+        committed
+    );
+    assert_eq!(log.commit()?, position(3, 2));
+    Ok(())
+}
+
 fn file(root: &Path, first_index: u64) -> std::path::PathBuf {
     root.join(format!("{first_index:020}.log"))
 }

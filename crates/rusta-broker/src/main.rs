@@ -6,6 +6,7 @@ mod group_protocol;
 mod groups;
 mod partition;
 mod protocol;
+mod topic_admin;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -79,11 +80,35 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let args: Vec<_> = std::env::args().skip(2).collect();
+    if command.as_deref() == Some("migrate-single-node") {
+        let [source] = args.as_slice() else {
+            anyhow::bail!("usage: migrate-single-node <source-directory>");
+        };
+        let settings = cluster::Settings::from_env()?
+            .context("migration requires cluster settings for the target")?;
+        cluster::migration::run(std::path::Path::new(source), &path, &settings)?;
+        println!(
+            "Migration target is ready. Import every bootstrap voter before starting the cluster."
+        );
+        return Ok(());
+    }
+    if command.as_deref() == Some("refresh-peer-pins") {
+        ensure!(args.is_empty(), "usage: refresh-peer-pins");
+        let settings =
+            cluster::Settings::from_env()?.context("pin refresh requires cluster settings")?;
+        let updated = settings.refresh_peer_pins(&path)?;
+        println!("Refreshed {updated} staged peer pins.");
+        return Ok(());
+    }
     let admin = match (command.as_deref(), args.as_slice()) {
         (Some("rebalance"), []) => Some(cluster::admin::Command::Rebalance {
             id: uuid::Uuid::new_v4(),
         }),
         (Some("rebalance"), [id]) => Some(cluster::admin::Command::Rebalance { id: id.parse()? }),
+        (Some("peer-inventory"), []) => Some(cluster::admin::Command::PeerInventory),
+        (Some("stage-peer"), [spec]) => {
+            Some(cluster::admin::Command::StagePeer { spec: spec.clone() })
+        }
         (Some("relocation-status"), []) => Some(cluster::admin::Command::RelocationStatus),
         (Some("transfer-leadership"), [topic, partition, to]) => {
             Some(cluster::admin::Command::Transfer {
@@ -92,9 +117,18 @@ async fn main() -> Result<()> {
                 to: to.parse()?,
             })
         }
-        (Some("rebalance" | "relocation-status" | "transfer-leadership"), _) => {
+        (
+            Some(
+                "rebalance"
+                | "peer-inventory"
+                | "stage-peer"
+                | "relocation-status"
+                | "transfer-leadership",
+            ),
+            _,
+        ) => {
             anyhow::bail!(
-                "usage: rebalance [request-uuid] | relocation-status | transfer-leadership <topic> <partition> <broker-id>"
+                "usage: rebalance [request-uuid] | peer-inventory | stage-peer <id,raft,host,internal> | relocation-status | transfer-leadership <topic> <partition> <broker-id>"
             );
         }
         _ => None,
@@ -110,16 +144,12 @@ async fn main() -> Result<()> {
     let host = host.context("missing host listener")?;
     let internal = Listener::from_env("RUSTA_INTERNAL_BIND", "RUSTA_INTERNAL_ADVERTISED", None)?;
     std::fs::create_dir_all(&path)?;
-    let mode_lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path.join("mode-lock"))?;
-    mode_lock.try_lock().map_err(std::io::Error::from)?;
+    let _mode_lock = lock_data(&path)?;
+    cluster::migration::check_target(&path)?;
     let (catalog, cluster) = match cluster::Settings::from_env()? {
         Some(settings) => (None, Some(cluster::Cluster::start(settings, &path).await?)),
         None => {
+            cluster::migration::check_single_node(&path)?;
             ensure!(
                 !path.join("cluster-identity").exists(),
                 "cluster volume cannot be opened as a singleton"
@@ -179,6 +209,17 @@ async fn main() -> Result<()> {
             Ok(())
         })
         .await
+}
+
+fn lock_data(root: &std::path::Path) -> Result<std::fs::File> {
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join("mode-lock"))?;
+    lock.try_lock().map_err(std::io::Error::from)?;
+    Ok(lock)
 }
 
 async fn maintenance(state: Arc<Server>) -> Result<()> {
@@ -317,10 +358,7 @@ async fn connection(
                     .work(move |catalog| Ok(catalog.groups.join(request, client, host)))
                     .await?;
                 drop(request_slot.take());
-                let mut response = completion.await?;
-                if head.version == 6 && response.protocol_name.is_none() {
-                    response.protocol_name = Some(StrBytes::default());
-                }
+                let response = group_protocol::join_response(completion.await?, head.version);
                 Some(encode(&head, head.version, &response)?)
             }
             Request::SyncGroup(request) => {
@@ -328,7 +366,8 @@ async fn connection(
                     .work(move |catalog| Ok(catalog.groups.sync(request)))
                     .await?;
                 drop(request_slot.take());
-                Some(encode(&head, head.version, &completion.await?)?)
+                let response = group_protocol::sync_response(completion.await?, head.version);
+                Some(encode(&head, head.version, &response)?)
             }
             Request::Fetch(request) => {
                 let version = head.version;

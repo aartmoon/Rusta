@@ -1,7 +1,7 @@
 services:
   broker:
     build: .
-    image: rusta:local
+    image: ${RUSTA_IMAGE:-rusta:local}
     environment:
       RUSTA_ADVERTISED: 127.0.0.1:${RUSTA_PORT:-9092}
       RUSTA_INTERNAL_BIND: 0.0.0.0:29092

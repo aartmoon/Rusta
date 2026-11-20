@@ -1,11 +1,15 @@
 pub mod admin;
+mod checkpoint;
 mod disk;
 mod engine;
 mod groups;
 mod kafka;
+mod producers;
+mod topics;
 mod transport;
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -13,12 +17,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use rusta_kafka::protocol::StrBytes;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, Semaphore};
 use uuid::Uuid;
 
 use crate::protocol::Endpoint;
 
 use self::engine::Engine;
+pub use self::engine::migration;
 
 #[derive(Clone)]
 pub struct Settings {
@@ -26,16 +32,79 @@ pub struct Settings {
     pub cluster: Uuid,
     pub peers: BTreeMap<u64, Peer>,
     pub bootstrap_voters: Vec<u64>,
+    staged_peers: BTreeMap<u64, [u8; 32]>,
     bind: SocketAddr,
     certificates: PathBuf,
 }
 
 #[derive(Clone)]
 pub struct Peer {
+    spec: String,
     raft: String,
     dns: String,
     pub host: Endpoint,
     pub internal: Endpoint,
+}
+
+const STAGED_PEERS: &str = "staged-peers.json";
+const MAX_INVENTORY_BYTES: u64 = 512 * 1024;
+
+#[derive(Deserialize, Serialize)]
+struct StagedPeer {
+    spec: String,
+    fingerprint: [u8; 32],
+}
+
+impl Peer {
+    fn parse(spec: &str) -> Result<(u64, Self)> {
+        ensure!(
+            spec.len() <= 1024 && !spec.contains([';', '\n', '\r']),
+            "invalid peer entry"
+        );
+        let fields: Vec<_> = spec.split(',').collect();
+        ensure!(
+            fields.len() == 4,
+            "peer entries require id,raft-address,host-kafka,internal-kafka"
+        );
+        let member: u64 = fields[0].parse()?;
+        ensure!(
+            (1..=255).contains(&member),
+            "node ID must be between 1 and 255"
+        );
+        let (name, port) = fields[1]
+            .rsplit_once(':')
+            .context("missing Raft peer port")?;
+        ensure!(
+            !name.is_empty() && port.parse::<u16>()? != 0,
+            "invalid Raft peer address"
+        );
+        transport::validate_name(name)?;
+        Ok((
+            member,
+            Self {
+                spec: spec.to_owned(),
+                raft: fields[1].to_owned(),
+                dns: name.to_owned(),
+                host: endpoint(fields[2])?,
+                internal: endpoint(fields[3])?,
+            },
+        ))
+    }
+}
+
+fn load_staged_peers(root: &Path) -> Result<BTreeMap<u64, StagedPeer>> {
+    let file = match std::fs::File::open(root.join(STAGED_PEERS)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_INVENTORY_BYTES + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= MAX_INVENTORY_BYTES,
+        "staged peer inventory exceeds size limit"
+    );
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 impl Settings {
@@ -48,29 +117,7 @@ impl Settings {
         ensure!(!cluster.is_nil(), "cluster ID cannot be nil");
         let mut peers = BTreeMap::new();
         for line in std::env::var("RUSTA_CLUSTER_PEERS")?.split(';') {
-            let fields: Vec<_> = line.split(',').collect();
-            ensure!(
-                fields.len() == 4,
-                "peer entries require id,raft-address,host-kafka,internal-kafka"
-            );
-            let member: u64 = fields[0].parse()?;
-            ensure!(
-                (1..=255).contains(&member),
-                "node ID must be between 1 and 255"
-            );
-            let (name, port) = fields[1]
-                .rsplit_once(':')
-                .context("missing Raft peer port")?;
-            ensure!(
-                !name.is_empty() && port.parse::<u16>()? != 0,
-                "invalid Raft peer address"
-            );
-            let peer = Peer {
-                raft: fields[1].to_owned(),
-                dns: name.to_owned(),
-                host: endpoint(fields[2])?,
-                internal: endpoint(fields[3])?,
-            };
+            let (member, peer) = Peer::parse(line)?;
             ensure!(peers.insert(member, peer).is_none(), "duplicate peer ID");
         }
         ensure!(
@@ -101,9 +148,59 @@ impl Settings {
             cluster,
             peers,
             bootstrap_voters,
+            staged_peers: BTreeMap::new(),
             bind,
             certificates,
         }))
+    }
+
+    fn apply_staged_peers(&mut self, root: &Path) -> Result<()> {
+        let staged = load_staged_peers(root)?;
+        self.merge_staged_peers(&staged)?;
+        for (id, staged) in staged {
+            let pin = transport::load_pin(&self.certificates, id)?;
+            ensure!(
+                transport::peer_fingerprint(&pin, &staged.spec) == staged.fingerprint,
+                "staged peer certificate has changed"
+            );
+        }
+        Ok(())
+    }
+
+    fn merge_staged_peers(&mut self, peers: &BTreeMap<u64, StagedPeer>) -> Result<()> {
+        for (&id, staged) in peers {
+            let (member, peer) = Peer::parse(&staged.spec)?;
+            ensure!(id == member, "staged peer ID mismatch");
+            if let Some(existing) = self.peers.get(&id) {
+                ensure!(
+                    existing.spec == peer.spec,
+                    "staged peer conflicts with startup inventory"
+                );
+            } else {
+                self.peers.insert(id, peer);
+            }
+            self.staged_peers.insert(id, staged.fingerprint);
+        }
+        Ok(())
+    }
+
+    pub fn refresh_peer_pins(mut self, root: &Path) -> Result<usize> {
+        ensure!(
+            root.join("cluster-identity").is_file(),
+            "pin refresh requires an initialized cluster volume"
+        );
+        let _lock = crate::lock_data(root).context("stop this broker before changing peer pins")?;
+        migration::check_target(root)?;
+        self.ensure_identity(root)?;
+        let mut staged = load_staged_peers(root)?;
+        self.merge_staged_peers(&staged)?;
+        transport::Tls::load(&self)?.validate_inventory(&self)?;
+        for (&id, peer) in &mut staged {
+            let pin = transport::load_pin(&self.certificates, id)?;
+            peer.fingerprint = transport::peer_fingerprint(&pin, &peer.spec);
+        }
+        disk::replace(root, STAGED_PEERS, &serde_json::to_vec(&staged)?)?;
+        Ok(staged.len())
     }
 
     fn voter_mask(&self) -> [u8; 32] {
@@ -156,6 +253,8 @@ pub struct Cluster {
     data_available: Arc<Notify>,
     group_progress: Arc<Notify>,
     fetch_waiters: Semaphore,
+    transport: transport::Routes,
+    root: PathBuf,
 }
 
 pub fn request_decommission(root: &Path) -> Result<()> {
@@ -174,10 +273,12 @@ pub fn request_decommission(root: &Path) -> Result<()> {
 }
 
 impl Cluster {
-    pub async fn start(settings: Settings, root: &Path) -> Result<Arc<Self>> {
+    pub async fn start(mut settings: Settings, root: &Path) -> Result<Arc<Self>> {
         settings.ensure_identity(root)?;
+        settings.apply_staged_peers(root)?;
         let tls = transport::Tls::load(&settings)?;
-        let (outbound, routes) = transport::routes(&settings);
+        let routes = transport::Routes::new(&settings, tls);
+        let outbound = routes.connect_all(&settings);
         let node = Engine::open(settings.clone(), root, outbound)?;
         let cluster = Arc::new(Self {
             data_available: node.data_available.clone(),
@@ -185,8 +286,10 @@ impl Cluster {
             fetch_waiters: Semaphore::new(crate::WAITING_FETCHES),
             engine: Mutex::new(Some(node)),
             worker: Arc::new(Semaphore::new(1)),
+            transport: routes,
+            root: root.to_owned(),
         });
-        transport::start(settings, tls, routes, cluster.clone()).await?;
+        cluster.transport.listen(&settings, cluster.clone()).await?;
         admin::start(root, cluster.clone())?;
         let ticking = cluster.clone();
         tokio::spawn(async move {
@@ -201,6 +304,43 @@ impl Cluster {
             }
         });
         Ok(cluster)
+    }
+
+    async fn stage_peer(self: &Arc<Self>, spec: String) -> Result<u64> {
+        let (id, peer) = Peer::parse(&spec)?;
+        let cluster = self.clone();
+        let runtime = tokio::runtime::Handle::current();
+        self.call(move |engine| {
+            let result = (|| {
+                engine.check_peer(id, &peer)?;
+                let pin = transport::load_pin(&engine.settings.certificates, id)?;
+                let fingerprint = transport::peer_fingerprint(&pin, &spec);
+                cluster.transport.check_pin(id, &peer, &pin)?;
+                if let Some(&previous) = engine.settings.staged_peers.get(&id) {
+                    ensure!(
+                        previous == fingerprint,
+                        "staged peer certificate has changed"
+                    );
+                    return Ok(id);
+                }
+                let mut staged = load_staged_peers(&cluster.root)?;
+                if let Some(previous) = staged.insert(id, StagedPeer { spec, fingerprint }) {
+                    ensure!(
+                        previous.fingerprint == fingerprint,
+                        "node ID already staged with a different identity"
+                    );
+                }
+                disk::replace(&cluster.root, STAGED_PEERS, &serde_json::to_vec(&staged)?)?;
+                if !engine.settings.peers.contains_key(&id) {
+                    let sender = cluster.transport.add(id, peer.clone(), pin, &runtime);
+                    engine.add_peer(id, peer, sender);
+                }
+                engine.settings.staged_peers.insert(id, fingerprint);
+                Ok(id)
+            })();
+            Ok(result)
+        })
+        .await?
     }
 
     async fn call<T: Send + 'static>(

@@ -9,7 +9,7 @@ use rusta_kafka::{
 use uuid::Uuid;
 
 use crate::catalog::{Catalog, DEFAULT_RETENTION_MS, MAX_PARTITIONS, Topic, TopicConfig};
-use crate::partition::MAX_BATCH;
+use crate::{partition::MAX_BATCH, topic_admin};
 
 pub const BROKER: BrokerId = BrokerId(1);
 const FETCH_MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -23,6 +23,7 @@ pub enum Error {
     LeaderUnavailable = 5,
     NotLeader = 6,
     RequestTimedOut = 7,
+    BrokerNotAvailable = 8,
     MessageTooLarge = 10,
     OffsetMetadataTooLarge = 12,
     CoordinatorLoadInProgress = 14,
@@ -90,7 +91,7 @@ impl Catalog {
                 encode(head, v, &Self::find_coordinator(request, v, endpoint))?
             }
             Request::Heartbeat(request) => encode(head, v, &self.heartbeat(request))?,
-            Request::LeaveGroup(request) => encode(head, v, &self.leave_group(request))?,
+            Request::LeaveGroup(request) => encode(head, v, &self.leave_group(request, v))?,
             Request::OffsetCommit(request) => encode(head, v, &self.offset_commit(request))?,
             Request::OffsetFetch(request) => encode(head, v, &self.offset_fetch(request, v))?,
             Request::DescribeGroups(request) => encode(head, v, &self.describe_groups(request, v))?,
@@ -99,7 +100,22 @@ impl Catalog {
                 anyhow::bail!("group request must run through its completion channel")
             }
             Request::Metadata(request) => encode(head, v, &self.metadata(request, endpoint))?,
-            Request::CreateTopics(request) => encode(head, v, &self.create_topics(request))?,
+            Request::CreateTopics(request) => encode(
+                head,
+                v,
+                &topic_admin::create_response(self.create_topics(request), v),
+            )?,
+            Request::DeleteTopics(request) => encode(head, v, &self.delete_topics(request, v))?,
+            Request::DescribeConfigs(request) => encode(
+                head,
+                v,
+                &topic_admin::describe(request, v, DEFAULT_RETENTION_MS, |name| {
+                    self.topics.get(name).map(|topic| &topic.config)
+                }),
+            )?,
+            Request::IncrementalAlterConfigs(request) => {
+                encode(head, v, &self.alter_configs(request))?
+            }
             Request::InitProducerId(request) => encode(head, v, &self.init_producer(request))?,
             Request::Produce(request) => {
                 let no_reply = request.acks == 0;
@@ -250,6 +266,69 @@ impl Catalog {
             })
             .collect();
         messages::CreateTopicsResponse::default().with_topics(results)
+    }
+
+    fn delete_topics(
+        &mut self,
+        request: messages::DeleteTopicsRequest,
+        version: i16,
+    ) -> messages::DeleteTopicsResponse {
+        let responses = topic_admin::deletes(request)
+            .map(|mut target| {
+                match topic_admin::resolve_delete(
+                    &target,
+                    |name| self.topics.get(name).map(|topic| &topic.config),
+                    |id| {
+                        self.names_by_id
+                            .get(&id)
+                            .and_then(|name| self.topics.get(name))
+                            .map(|topic| &topic.config)
+                    },
+                )
+                .cloned()
+                {
+                    Ok(topic) => {
+                        topic_admin::confirm_delete(&mut target, &topic, version);
+                        if let Err(error) = self.delete_topic(topic.name, topic.id) {
+                            eprintln!("delete topic {}: {error:#}", topic.id);
+                            target.error_code = Error::Storage as i16;
+                        }
+                    }
+                    Err(error) => target.error_code = error as i16,
+                }
+                target
+            })
+            .collect();
+        messages::DeleteTopicsResponse::default().with_responses(responses)
+    }
+
+    fn alter_configs(
+        &mut self,
+        request: messages::IncrementalAlterConfigsRequest,
+    ) -> messages::IncrementalAlterConfigsResponse {
+        let responses = request
+            .resources
+            .into_iter()
+            .map(|resource| {
+                let mut result = topic_admin::alter_result(&resource);
+                let topic = self
+                    .topics
+                    .get(resource.resource_name.as_str())
+                    .map(|topic| &topic.config);
+                match topic_admin::alter(&resource, topic) {
+                    Ok(config) if !request.validate_only => {
+                        if let Err(error) = self.alter_topic(config) {
+                            eprintln!("alter topic configs: {error:#}");
+                            result.error_code = Error::Storage as i16;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => result.error_code = error as i16,
+                }
+                result
+            })
+            .collect();
+        messages::IncrementalAlterConfigsResponse::default().with_responses(responses)
     }
 
     fn init_producer(
@@ -607,16 +686,11 @@ pub fn topic_config(
             return Err(Error::InvalidConfig);
         }
         let value = config.value.as_ref().ok_or(Error::InvalidConfig)?.as_str();
-        let limit = || {
-            value
-                .parse::<i64>()
-                .ok()
-                .filter(|value| *value >= -1)
-                .ok_or(Error::InvalidConfig)
-        };
         match key {
-            "retention.ms" => retention_ms = Some(limit()?),
-            "retention.bytes" => retention_bytes = Some(limit()?),
+            "retention.ms" => retention_ms = Some(crate::topic_admin::retention_value(value)?),
+            "retention.bytes" => {
+                retention_bytes = Some(crate::topic_admin::retention_value(value)?)
+            }
             "cleanup.policy" if value == "delete" => {}
             "rusta.allow.weak.acks" => {
                 allow_weak_acks = value.parse().map_err(|_| Error::InvalidConfig)?
@@ -631,6 +705,7 @@ pub fn topic_config(
         allow_weak_acks,
         retention_ms,
         retention_bytes,
+        legacy_retention_since_ms: None,
     })
 }
 

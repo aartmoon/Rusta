@@ -8,7 +8,7 @@ use anyhow::{Context, Result, ensure};
 use bytes::{BufMut, Bytes, BytesMut};
 use protobuf::Message as ProtoMessage;
 use raft::{
-    Config, RawNode, StateRole, Storage,
+    Config, RawNode, SnapshotStatus, StateRole, Storage,
     eraftpb::{ConfChange, ConfChangeType, EntryType, Message, MessageType},
 };
 use rusta_kafka::records::Batch;
@@ -17,17 +17,24 @@ use tokio::sync::{Notify, Semaphore, oneshot};
 use uuid::Uuid;
 
 use crate::{
-    catalog::{MAX_PARTITIONS, TopicConfig},
+    catalog::{MAX_PARTITIONS, TopicConfig, remove_topic_data},
     groups::{self, Completion, Group, Groups},
-    partition::{History, MAX_BATCH, MAX_PRODUCER_STATES},
+    partition::MAX_BATCH,
     protocol::Error,
 };
 
 use super::{
-    Settings,
+    Peer, Settings,
     disk::{Disk, decode_change, encode_batch, encode_retention, replace},
+    producers,
     transport::{Packet, Queued, Senders},
 };
+
+#[path = "migration.rs"]
+pub mod migration;
+#[path = "snapshots.rs"]
+mod snapshots;
+use snapshots::{ControlState, GroupState};
 
 type Reply<T> = oneshot::Receiver<Result<T, Error>>;
 type GroupOperation<T> = (T, Option<Reply<i64>>);
@@ -112,6 +119,8 @@ pub struct Engine {
     send_bytes: Arc<Semaphore>,
     replicas: HashMap<GroupId, Vec<u64>>,
     origins: HashMap<GroupId, Vec<u64>>,
+    imported_offsets: HashMap<GroupId, i64>,
+    imported_producer_floor: i64,
     retired: BTreeSet<u64>,
     relocation: Option<RelocationPlan>,
     last_rebalance: Option<Uuid>,
@@ -127,16 +136,21 @@ pub struct Engine {
     reserved_producer: u64,
     data: PathBuf,
     group_retention_ms: u64,
+    producer_retention_ms: u64,
+    peer_readiness: HashMap<u64, BTreeMap<u64, [u8; 32]>>,
+    compaction_cursor: Option<GroupId>,
+    internal_snapshot_interval: u64,
+    rebuilding_catalog: bool,
 }
 
 pub struct Node {
     raw: RawNode<Disk>,
     pending: Option<Pending>,
     reads: HashMap<Vec<u8>, Read>,
-    histories: HashMap<i64, History>,
     committed_term: u64,
     group: Option<GroupShard>,
     fetch_leadership: (u64, u64),
+    snapshot_deadlines: HashMap<u64, Instant>,
 }
 
 struct Pending {
@@ -187,6 +201,17 @@ enum Event {
         config: TopicConfig,
         replicas: Vec<Vec<u64>>,
     },
+    ImportedTopic {
+        config: TopicConfig,
+        replicas: Vec<Vec<u64>>,
+        starts: Vec<i64>,
+    },
+    ImportedProducers(i64),
+    AlterTopic(TopicConfig),
+    DeleteTopic {
+        name: String,
+        id: Uuid,
+    },
 }
 
 impl Engine {
@@ -199,6 +224,7 @@ impl Engine {
             &data.join("control"),
             settings.bootstrap_voters.clone(),
             CONTROL,
+            0,
         )?;
         let membership = &control.raw.store().membership;
         ensure!(
@@ -221,6 +247,8 @@ impl Engine {
             send_bytes: Arc::new(Semaphore::new(32 * 1024 * 1024)),
             replicas: HashMap::new(),
             origins: HashMap::new(),
+            imported_offsets: HashMap::new(),
+            imported_producer_floor: 0,
             retired: BTreeSet::new(),
             relocation: None,
             last_rebalance: None,
@@ -239,7 +267,15 @@ impl Engine {
             reserved_producer: counter,
             data,
             group_retention_ms: groups::retention_ms()?,
+            producer_retention_ms: producers::retention_ms()?,
+            peer_readiness: HashMap::new(),
+            compaction_cursor: None,
+            internal_snapshot_interval: snapshots::interval()?,
+            rebuilding_catalog: true,
         };
+        if let Some(state) = control.raw.store().internal_state::<ControlState>()? {
+            engine.restore_control(state)?;
+        }
         let log = &control.raw.store().log;
         let mut index = log.start().next_index;
         let end = log.committed().next_index;
@@ -256,6 +292,10 @@ impl Engine {
                 Ok(())
             })?;
         }
+        engine.rebuilding_catalog = false;
+        engine.open_current_replicas()?;
+        engine.open_destination()?;
+        engine.remove_deleted_topic_data()?;
         engine.nodes.insert(CONTROL, control);
         Ok(engine)
     }
@@ -280,20 +320,77 @@ impl Engine {
     }
 
     fn apply(&mut self, event: Event) -> Result<()> {
-        let (config, placements) = match event {
+        let (config, placements, starts) = match event {
+            Event::AlterTopic(config) => {
+                let old = self
+                    .topics
+                    .get_mut(&config.name)
+                    .context("altered topic missing")?;
+                ensure!(
+                    old.id == config.id && old.partitions == config.partitions,
+                    "altered topic identity changed"
+                );
+                *old = config;
+                return Ok(());
+            }
+            Event::DeleteTopic { name, id } => {
+                let topic = self.topics.remove(&name).context("deleted topic missing")?;
+                ensure!(topic.id == id, "deleted topic identity mismatch");
+                self.names.remove(&id);
+                for partition in 0..topic.partitions {
+                    let key = GroupId {
+                        topic: id,
+                        partition: partition as u32,
+                    };
+                    self.nodes.remove(&key);
+                    self.replicas.remove(&key);
+                    self.origins.remove(&key);
+                    self.imported_offsets.remove(&key);
+                    self.leaders.remove(&key);
+                    if !self.rebuilding_catalog {
+                        remove_topic_data(
+                            &self.data,
+                            &self.data.join(format!("{id}-{partition}")),
+                        )?;
+                    }
+                }
+                self.data_available.notify_waiters();
+                return Ok(());
+            }
             Event::Topic(config) => {
                 let members = self.settings.bootstrap_voters.clone();
                 let placements = vec![members; config.partitions];
-                (config, placements)
+                (config, placements, None)
             }
-            Event::PlacedTopic { config, replicas } => (config, replicas),
+            Event::PlacedTopic { config, replicas } => (config, replicas, None),
+            Event::ImportedTopic {
+                config,
+                replicas,
+                starts,
+            } => {
+                ensure!(
+                    starts.len() == config.partitions && starts.iter().all(|&offset| offset >= 0),
+                    "invalid migration offset bases"
+                );
+                (config, replicas, Some(starts))
+            }
+            Event::ImportedProducers(high) => {
+                ensure!(
+                    self.imported_producer_floor == 0 && high > 0 && high <= i64::MAX - (4096 << 8),
+                    "invalid imported producer ID ceiling"
+                );
+                self.imported_producer_floor = high;
+                self.reserved_producer = self.reserved_producer.max((high as u64) >> 8);
+                self.next_producer = self.next_producer.max(self.reserved_producer + 1);
+                return Ok(());
+            }
             Event::GroupShards(placements) => {
                 ensure!(
                     self.replicas(group_shard(0)).is_empty(),
                     "duplicate group shard placement"
                 );
                 for (index, voters) in placements.into_iter().enumerate() {
-                    self.register(group_shard(index), voters)?;
+                    self.register(group_shard(index), voters, 0)?;
                 }
                 return Ok(());
             }
@@ -387,14 +484,34 @@ impl Engine {
                 topic: config.id,
                 partition: partition as u32,
             };
-            self.register(key, voters)?;
+            self.register(
+                key,
+                voters,
+                starts.as_ref().map_or(0, |starts| starts[partition]),
+            )?;
         }
         self.names.insert(config.id, config.name.clone());
         self.topics.insert(config.name.clone(), config);
         Ok(())
     }
 
-    fn register(&mut self, key: GroupId, voters: Vec<u64>) -> Result<()> {
+    fn remove_deleted_topic_data(&self) -> Result<()> {
+        for entry in fs::read_dir(&self.data)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if let Some((topic, partition)) = name.to_str().and_then(|name| name.rsplit_once('-'))
+                && let Ok(id) = Uuid::parse_str(topic)
+                && !id.is_nil()
+                && partition.parse::<u32>().is_ok()
+                && !self.names.contains_key(&id)
+            {
+                remove_topic_data(&self.data, &entry.path())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn register(&mut self, key: GroupId, voters: Vec<u64>, initial_offset: i64) -> Result<()> {
         let unique: BTreeSet<_> = voters.iter().collect();
         ensure!(
             !self.replicas.contains_key(&key)
@@ -403,13 +520,38 @@ impl Engine {
                 && voters.iter().all(|id| self.settings.peers.contains_key(id)),
             "invalid replica assignment"
         );
-        if voters.contains(&self.settings.id) {
+        if !self.rebuilding_catalog && voters.contains(&self.settings.id) {
             let path = self.data.join(format!("{}-{}", key.topic, key.partition));
-            self.nodes
-                .insert(key, Node::open(&self.settings, &path, voters.clone(), key)?);
+            self.nodes.insert(
+                key,
+                Node::open(&self.settings, &path, voters.clone(), key, initial_offset)?,
+            );
+        }
+        if initial_offset != 0 {
+            self.imported_offsets.insert(key, initial_offset);
         }
         self.origins.insert(key, voters.clone());
         self.replicas.insert(key, voters);
+        Ok(())
+    }
+
+    fn open_current_replicas(&mut self) -> Result<()> {
+        for (&key, voters) in &self.replicas {
+            if voters.contains(&self.settings.id) {
+                let path = self.data.join(format!("{}-{}", key.topic, key.partition));
+                let initial_offset = self.imported_offsets.get(&key).copied().unwrap_or(0);
+                self.nodes.insert(
+                    key,
+                    Node::open(
+                        &self.settings,
+                        &path,
+                        self.origins[&key].clone(),
+                        key,
+                        initial_offset,
+                    )?,
+                );
+            }
+        }
         Ok(())
     }
 
@@ -444,6 +586,9 @@ impl Engine {
     }
 
     fn open_destination(&mut self) -> Result<()> {
+        if self.rebuilding_catalog {
+            return Ok(());
+        }
         let Some(movement) = self.relocation.as_ref().and_then(RelocationPlan::active) else {
             return Ok(());
         };
@@ -456,7 +601,13 @@ impl Engine {
                 .context("missing partition bootstrap voters")?;
             self.nodes.insert(
                 key,
-                Node::open(&self.settings, &path, origins.clone(), key)?,
+                Node::open(
+                    &self.settings,
+                    &path,
+                    origins.clone(),
+                    key,
+                    self.imported_offsets.get(&key).copied().unwrap_or(0),
+                )?,
             );
         }
         Ok(())
@@ -857,6 +1008,46 @@ impl Engine {
         Ok(Ok(reply))
     }
 
+    pub fn controller(&self) -> bool {
+        self.nodes[&CONTROL].local_leader()
+    }
+
+    pub fn delete_topic(&mut self, config: TopicConfig) -> Result<Result<Reply<i64>, Error>> {
+        if self.relocation.as_ref().is_some_and(|plan| {
+            plan.movements
+                .iter()
+                .any(|movement| movement.key.topic == config.id)
+        }) {
+            return Ok(Err(Error::RequestTimedOut));
+        }
+        self.topic_change(Event::DeleteTopic {
+            name: config.name,
+            id: config.id,
+        })
+    }
+
+    pub fn alter_topic(&mut self, mut config: TopicConfig) -> Result<Result<Reply<i64>, Error>> {
+        if config.legacy_retention_since_ms.is_none()
+            && config.retention_ms.is_some_and(|value| value >= 0)
+        {
+            config.legacy_retention_since_ms = Some(groups::now_ms().max(1) as i64);
+        }
+        self.topic_change(Event::AlterTopic(config))
+    }
+
+    fn topic_change(&mut self, event: Event) -> Result<Result<Reply<i64>, Error>> {
+        let node = self.nodes.get_mut(&CONTROL).expect("control group");
+        if !node.local_leader() {
+            return Ok(Err(Error::NotController));
+        }
+        if !node.admitting() {
+            return Ok(Err(Error::RequestTimedOut));
+        }
+        let reply = node.propose(serde_json::to_vec(&event)?, 0)?;
+        self.drain(CONTROL)?;
+        Ok(Ok(reply))
+    }
+
     pub fn produce(&mut self, key: GroupId, records: Bytes) -> Result<Result<Write, Error>> {
         // Give a ready membership change the admission slot between batches.
         if let Some(movement) = self.relocation.as_ref().and_then(RelocationPlan::active)
@@ -892,26 +1083,22 @@ impl Engine {
         }
         if batch.producer > 0 {
             let broker = (batch.producer as u64) & 255;
-            if batch.producer < 256 || !self.settings.peers.contains_key(&broker) {
+            if batch.producer > self.imported_producer_floor
+                && (batch.producer < 256 || !self.settings.peers.contains_key(&broker))
+            {
                 return Ok(Err(Error::UnknownProducerId));
             }
             if batch.epoch != 0 {
                 return Ok(Err(Error::InvalidProducerEpoch));
             }
-            match node.histories.get(&batch.producer) {
-                Some(history) if batch.sequence != history.next_sequence => {
-                    let Some(offset) = history.find(batch) else {
-                        return Ok(Err(Error::OutOfOrderSequence));
-                    };
+            match node.raw.store().producers.check(batch) {
+                Ok(None) => {}
+                Ok(Some(offset)) => {
                     return self.read(key).map(|authorized| {
                         authorized.map(|barrier| Write::Existing(offset, barrier))
                     });
                 }
-                None if batch.sequence != 0 => return Ok(Err(Error::UnknownProducerId)),
-                None if node.histories.len() >= MAX_PRODUCER_STATES => {
-                    return Ok(Err(Error::PolicyViolation));
-                }
-                _ => {}
+                Err(error) => return Ok(Err(error)),
             }
         }
         let offset = node.raw.store().log.end().next_offset;
@@ -924,12 +1111,7 @@ impl Engine {
         bytes.extend_from_slice(&records[8..12]);
         bytes.put_i32(epoch);
         bytes.extend_from_slice(&records[16..]);
-        let timestamp = self
-            .names
-            .get(&key.topic)
-            .and_then(|name| self.topics.get(name))
-            .filter(|topic| topic.retention_ms.is_some_and(|limit| limit >= 0))
-            .map_or(0, |_| groups::now_ms().max(1) as i64);
+        let timestamp = groups::now_ms().max(1) as i64;
         let reply = node.propose(encode_batch(timestamp, &bytes), offset)?;
         self.drain(key)?;
         Ok(Ok(Write::Pending(reply)))
@@ -1077,6 +1259,46 @@ impl Engine {
         &self.nodes[&CONTROL].raw.store().membership.voters
     }
 
+    pub fn check_peer(&self, id: u64, peer: &Peer) -> Result<()> {
+        ensure!(!self.retired.contains(&id), "node ID has been retired");
+        if let Some(existing) = self.settings.peers.get(&id) {
+            ensure!(
+                existing.spec == peer.spec,
+                "node ID already has different endpoints"
+            );
+        } else {
+            ensure!(
+                !self
+                    .settings
+                    .peers
+                    .values()
+                    .any(|existing| existing.raft == peer.raft),
+                "Raft address already belongs to a configured node"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn add_peer(&mut self, id: u64, peer: Peer, sender: tokio::sync::mpsc::Sender<Queued>) {
+        self.outbound.insert(id, sender);
+        self.settings.peers.insert(id, peer);
+    }
+
+    pub fn peer_inventory(&self) -> serde_json::Value {
+        let control = &self.nodes[&CONTROL];
+        let membership = &control.raw.store().membership;
+        serde_json::json!({
+            "cluster_id": self.settings.cluster,
+            "node_id": self.settings.id,
+            "bootstrap_voters": self.settings.bootstrap_voters,
+            "configured_peers": self.settings.peers.keys().copied().collect::<Vec<_>>(),
+            "controller": control.raw.raft.leader_id,
+            "voters": membership.voters,
+            "learners": membership.learners,
+            "retired": self.retired,
+        })
+    }
+
     pub fn receive_join(&mut self, source: u64) -> Result<()> {
         if self.settings.peers.contains_key(&source)
             && !self.voters().contains(&source)
@@ -1091,6 +1313,12 @@ impl Engine {
         Ok(())
     }
 
+    pub fn receive_peer_ready(&mut self, source: u64, ready: BTreeMap<u64, [u8; 32]>) {
+        if !self.retired.contains(&source) {
+            self.peer_readiness.insert(source, ready);
+        }
+    }
+
     fn advance_membership(&mut self) -> Result<()> {
         self.join_requests.retain(|id, since| {
             since.elapsed() < Duration::from_secs(2)
@@ -1100,7 +1328,7 @@ impl Engine {
                     .as_ref()
                     .is_none_or(|plan| plan.node != Some(*id))
         });
-        let node = self.nodes.get_mut(&CONTROL).expect("control group");
+        let node = &self.nodes[&CONTROL];
         if !node.admitting() {
             return Ok(());
         }
@@ -1115,22 +1343,46 @@ impl Engine {
                     .get(*id)
                     .is_some_and(|p| p.matched >= committed && p.recent_active)
         });
-        let change = if let Some(id) = promotion {
-            Some((id, ConfChangeType::AddNode))
-        } else {
-            self.join_requests
-                .keys()
-                .copied()
-                .find(|id| !membership.voters.contains(id) && !membership.learners.contains(id))
-                .map(|id| (id, ConfChangeType::AddLearnerNode))
-        };
+        let change =
+            if let Some(id) = promotion {
+                Some((id, ConfChangeType::AddNode))
+            } else {
+                self.join_requests
+                    .keys()
+                    .copied()
+                    .find(|id| {
+                        !membership.voters.contains(id)
+                            && !membership.learners.contains(id)
+                            && self
+                                .settings
+                                .staged_peers
+                                .get(id)
+                                .is_none_or(|fingerprint| {
+                                    membership.voters.iter().chain(&membership.learners).all(
+                                        |peer| {
+                                            *peer == self.settings.id
+                                                || self
+                                                    .peer_readiness
+                                                    .get(peer)
+                                                    .and_then(|ids| ids.get(id))
+                                                    == Some(fingerprint)
+                                        },
+                                    )
+                                })
+                    })
+                    .map(|id| (id, ConfChangeType::AddLearnerNode))
+            };
         if let Some((id, kind)) = change {
             let mut change = ConfChange {
                 node_id: id,
                 ..ConfChange::default()
             };
             change.set_change_type(kind);
-            node.raw.propose_conf_change(Vec::new(), change)?;
+            self.nodes
+                .get_mut(&CONTROL)
+                .expect("control group")
+                .raw
+                .propose_conf_change(Vec::new(), change)?;
             self.drain(CONTROL)?;
         }
         Ok(())
@@ -1140,6 +1392,15 @@ impl Engine {
         let keys: Vec<_> = self.nodes.keys().copied().collect();
         for key in keys {
             if let Some(node) = self.nodes.get_mut(&key) {
+                let now = Instant::now();
+                node.snapshot_deadlines.retain(|&peer, deadline| {
+                    if now >= *deadline {
+                        node.raw.report_snapshot(peer, SnapshotStatus::Failure);
+                        false
+                    } else {
+                        true
+                    }
+                });
                 node.raw.tick();
                 self.drain(key)?;
                 if is_group_shard(key) {
@@ -1171,6 +1432,20 @@ impl Engine {
             self.bootstrap_groups()?;
             self.drive_relocation()?;
             self.advance_retention()?;
+            self.retire_producers()?;
+            self.compact_retention()?;
+            self.compact_internal()?;
+            if !self.settings.staged_peers.is_empty() {
+                let mut report = BytesMut::new();
+                for (&id, fingerprint) in &self.settings.staged_peers {
+                    report.put_u8(id as u8);
+                    report.extend_from_slice(fingerprint);
+                }
+                let report = report.freeze();
+                for queue in self.outbound.values() {
+                    Queued::send(queue, &self.send_bytes, Packet::PeerReady(report.clone()));
+                }
+            }
             if self.relocation.is_none() {
                 self.advance_membership()?;
             }
@@ -1218,12 +1493,13 @@ impl Engine {
                 continue;
             }
             let current = node.raw.store().retained;
-            let next = node.log().retention_boundary(
+            let next = node.log().retention_boundary_with_legacy_time(
                 current,
                 rusta_log::Retention {
                     keep_since_ms: keep_ms.map(|limit| time.saturating_sub(limit)),
                     max_bytes,
                 },
+                config.legacy_retention_since_ms,
             )?;
             if next.next_offset > current.next_offset {
                 proposals.push((key, next));
@@ -1239,11 +1515,105 @@ impl Engine {
         Ok(())
     }
 
+    fn compact_retention(&mut self) -> Result<()> {
+        let eligible = |node: &&Node| {
+            node.group.is_none()
+                && node
+                    .log()
+                    .first_compactable_segment(node.raw.store().retained.next_index)
+                    .is_some()
+        };
+        let next = self
+            .nodes
+            .iter()
+            .filter(|(key, node)| **key != CONTROL && eligible(node))
+            .find(|(key, _)| self.compaction_cursor.is_none_or(|cursor| **key > cursor))
+            .or_else(|| {
+                self.nodes
+                    .iter()
+                    .find(|(key, node)| **key != CONTROL && eligible(node))
+            })
+            .map(|(&key, _)| key);
+        if let Some(key) = next {
+            self.compaction_cursor = Some(key);
+            self.nodes
+                .get_mut(&key)
+                .expect("compaction candidate")
+                .raw
+                .mut_store()
+                .compact_retention()?;
+        }
+        Ok(())
+    }
+
+    fn retire_producers(&mut self) -> Result<()> {
+        let now = groups::now_ms();
+        let mut proposals = Vec::new();
+        for (&key, node) in &self.nodes {
+            if key != CONTROL
+                && node.group.is_none()
+                && node.admitting()
+                && let Some(record) = node
+                    .raw
+                    .store()
+                    .producers
+                    .maintenance_record(now, self.producer_retention_ms)
+            {
+                proposals.push((key, record));
+            }
+        }
+        for (key, record) in proposals {
+            self.nodes
+                .get_mut(&key)
+                .expect("existing partition")
+                .propose(record, 0)?;
+            self.drain(key)?;
+        }
+        Ok(())
+    }
+
     pub fn receive(&mut self, key: GroupId, message: Message) -> Result<()> {
         if self.retired.contains(&message.from) {
             return Ok(());
         }
         if let Some(node) = self.nodes.get_mut(&key) {
+            if message.get_msg_type() == MessageType::MsgSnapshot {
+                let snapshot = message.get_snapshot();
+                let checked = node
+                    .raw
+                    .store()
+                    .validate_snapshot(snapshot, self.settings.id);
+                let metadata = snapshot.get_metadata();
+                let members = metadata.get_conf_state();
+                if checked.is_err()
+                    || metadata.term > message.term
+                    || members
+                        .voters
+                        .iter()
+                        .chain(&members.learners)
+                        .any(|id| !self.settings.peers.contains_key(id))
+                {
+                    eprintln!("ignored invalid partition snapshot from {}", message.from);
+                    return Ok(());
+                }
+                if metadata.index >= node.log().committed().next_index {
+                    let checked = if key == CONTROL {
+                        snapshots::control_state(snapshot.get_data())
+                            .and_then(|state| state.validate(&self.settings))
+                    } else if node.group.is_some() {
+                        snapshots::group_state(snapshot.get_data()).map(|_| ())
+                    } else {
+                        Ok(())
+                    };
+                    if let Err(error) = checked {
+                        eprintln!(
+                            "ignored invalid internal snapshot from {}: {error:#}",
+                            message.from
+                        );
+                        return Ok(());
+                    }
+                }
+            }
             // A transport response can be obsolete after a leadership change.
             let _ = node.raw.step(message);
             self.drain(key)?;
@@ -1263,9 +1633,26 @@ impl Engine {
         let mut events = Vec::new();
         let mut completions = Vec::new();
         let mut completed_term = None;
+        let mut control_snapshot = None;
         while node.raw.has_ready() {
             let mut ready = node.raw.ready();
-            ensure!(ready.snapshot().is_empty(), "unexpected Raft snapshot");
+            let snapshot = (!ready.snapshot().is_empty()).then_some(ready.snapshot());
+            let snapshot_index = if let Some(snapshot) = snapshot {
+                node.raw.mut_store().persist(ready.hs(), &[])?;
+                node.raw
+                    .mut_store()
+                    .install_snapshot(snapshot, self.settings.id)?;
+                if key == CONTROL {
+                    control_snapshot = Some(snapshots::control_state(snapshot.get_data())?);
+                } else if let Some(shard) = &mut node.group {
+                    shard.committed = snapshots::group_state(snapshot.get_data())?;
+                    shard.active = None;
+                }
+                node.committed_term = snapshot.get_metadata().term;
+                Some(snapshot.get_metadata().index)
+            } else {
+                None
+            };
             node.raw.mut_store().persist(ready.hs(), ready.entries())?;
             let mut committed = ready.take_committed_entries();
             let messages = ready
@@ -1275,6 +1662,9 @@ impl Engine {
             let states = ready.take_read_states();
             let mut light = node.raw.advance_append(ready);
             committed.extend(light.take_committed_entries());
+            if let Some(index) = snapshot_index {
+                node.raw.advance_apply_to(index);
+            }
 
             if let Some(last) = committed.last() {
                 node.raw.mut_store().log.commit_through(last.index + 1)?;
@@ -1294,10 +1684,8 @@ impl Engine {
                         events.push(serde_json::from_slice(&entry.data)?);
                     } else if let Some(shard) = &mut node.group {
                         apply_shard_record(&mut shard.committed, &entry.data)?;
-                    } else if let Some(batch) =
-                        node.raw.mut_store().apply_data(entry.index, &entry.data)?
-                    {
-                        node.note_batch(batch)?;
+                    } else {
+                        node.raw.mut_store().apply_data(entry.index, &entry.data)?;
                     }
                 }
                 if node
@@ -1311,12 +1699,19 @@ impl Engine {
                 }
                 node.raw.advance_apply_to(entry.index);
             }
+            node.raw.mut_store().checkpoint_if_due();
             for state in states {
                 if let Some(read) = node.reads.get_mut(&state.request_ctx) {
                     read.authorized = Some(state.index);
                 }
             }
             for message in messages.chain(light.take_messages()) {
+                let snapshot = message.get_msg_type() == MessageType::MsgSnapshot;
+                if snapshot {
+                    // If the route drops this frame, expire Raft's paused progress and retry.
+                    node.snapshot_deadlines
+                        .insert(message.to, Instant::now() + Duration::from_secs(5));
+                }
                 if destination == Some(message.to)
                     && node.raw.store().membership.learners.contains(&message.to)
                     && message.get_msg_type() == MessageType::MsgAppend
@@ -1397,8 +1792,15 @@ impl Engine {
             }
             node.fetch_leadership = leadership;
         }
+        let installed_control_snapshot = control_snapshot.is_some();
+        if let Some(state) = control_snapshot {
+            self.restore_control(state)?;
+        }
         for event in events {
             self.apply(event)?;
+        }
+        if installed_control_snapshot {
+            self.remove_deleted_topic_data()?;
         }
         for pending in completions {
             let result = if is_group_shard(key) && (!local_leader || pending.term != term) {
@@ -1482,32 +1884,25 @@ pub enum Write {
 }
 
 impl Node {
-    fn open(settings: &Settings, path: &Path, voters: Vec<u64>, key: GroupId) -> Result<Self> {
-        let mut histories = HashMap::<i64, History>::new();
+    fn open(
+        settings: &Settings,
+        path: &Path,
+        voters: Vec<u64>,
+        key: GroupId,
+        initial_offset: i64,
+    ) -> Result<Self> {
         let disk = Disk::open(
             path,
             voters,
             key == CONTROL || is_group_shard(key),
-            |entry, payload| {
-                let batch = Batch::parse(payload).map_err(std::io::Error::other)?;
-                if batch.producer > 0 {
-                    if !histories.contains_key(&batch.producer)
-                        && histories.len() >= MAX_PRODUCER_STATES
-                    {
-                        return Err(std::io::Error::other(
-                            "partition producer state exceeds limit",
-                        ));
-                    }
-                    histories
-                        .entry(batch.producer)
-                        .or_default()
-                        .add(batch, entry.position.next_offset);
-                }
-                Ok(())
-            },
+            initial_offset,
         )?;
         let group = if is_group_shard(key) {
-            let mut committed = HashMap::new();
+            let mut committed = disk
+                .internal_state::<GroupState>()?
+                .map(GroupState::restore)
+                .transpose()?
+                .unwrap_or_default();
             let mut next = disk.log.start().next_index;
             let end = disk.log.committed().next_index;
             while next < end {
@@ -1554,10 +1949,10 @@ impl Node {
             raw,
             pending: None,
             reads: HashMap::new(),
-            histories,
             committed_term,
             group,
             fetch_leadership: (0, 0),
+            snapshot_deadlines: HashMap::new(),
         })
     }
 
@@ -1579,6 +1974,10 @@ impl Node {
 
     pub fn log_start(&self) -> i64 {
         self.raw.store().retained.next_offset
+    }
+
+    pub fn compacted_data_epoch(&self) -> Option<i32> {
+        self.raw.store().compacted_data_epoch
     }
 
     pub fn in_sync(&self) -> Vec<u64> {
@@ -1625,23 +2024,6 @@ impl Node {
         });
         Ok(receiver)
     }
-
-    fn note_batch(&mut self, bytes: &[u8]) -> Result<()> {
-        let batch = Batch::parse(bytes)?;
-        if batch.producer > 0 {
-            ensure!(
-                self.histories.contains_key(&batch.producer)
-                    || self.histories.len() < MAX_PRODUCER_STATES,
-                "partition producer state exceeds limit"
-            );
-            let offset = i64::from_be_bytes(bytes[..8].try_into()?);
-            self.histories
-                .entry(batch.producer)
-                .or_default()
-                .add(batch, offset);
-        }
-        Ok(())
-    }
 }
 
 fn encode_counter(next: u64) -> [u8; 12] {
@@ -1671,10 +2053,7 @@ fn read_counter(root: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        cluster::transport,
-        groups::{Key, Offset},
-    };
+    use crate::groups::{Key, Offset};
     use tokio::sync::oneshot::error::TryRecvError;
 
     const GROUP: &str = "fault-test";
@@ -1697,6 +2076,7 @@ mod tests {
                     (
                         id,
                         super::super::Peer {
+                            spec: String::new(),
                             raft: String::new(),
                             dns: String::new(),
                             host: endpoint.clone(),
@@ -1713,10 +2093,20 @@ mod tests {
                     cluster,
                     peers: peers.clone(),
                     bootstrap_voters: vec![1, 2, 3],
+                    staged_peers: BTreeMap::new(),
                     bind: "127.0.0.1:0".parse()?,
                     certificates: PathBuf::new(),
                 };
-                let (senders, receivers) = transport::routes(&settings);
+                let (senders, receivers) = settings
+                    .peers
+                    .keys()
+                    .copied()
+                    .filter(|&peer| peer != id)
+                    .map(|peer| {
+                        let (sender, receiver) = tokio::sync::mpsc::channel(16);
+                        ((peer, sender), (peer, receiver))
+                    })
+                    .unzip();
                 brokers.push(Some(Engine::open(
                     settings,
                     &root.path().join(id.to_string()),

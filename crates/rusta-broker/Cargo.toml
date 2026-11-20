@@ -11,6 +11,7 @@ bytes = "1"
 crc32c = "0.6.9"
 protobuf = "2.28"
 raft = { version = "0.7.0", default-features = false, features = ["protobuf-codec"] }
+ring = "0.17"
 rustls-pemfile = "2"
 slog = "2"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
@@ -20,6 +21,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "sync", "time", "signal"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+zstd = "0.13"
 
 [dev-dependencies]
 tempfile = "3"

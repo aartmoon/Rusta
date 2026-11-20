@@ -72,8 +72,32 @@ data_test() {
     java -Dorg.slf4j.simpleLogger.defaultLogLevel=error -cp "$scratch:$scratch/deps/*" ClusterDataPathSmoke "$1" "$2" "$scratch"
 }
 "${compose[@]}" up -d --wait
-data_test write "$nodes"
+"${compose[@]}" kill -s SIGKILL broker3
+data_test write "$(endpoint 1),$(endpoint 2)"
 retention_leader="$(head -1 "$scratch/retention-leader")"
+has_snapshot() {
+    local broker="$1"
+    "${compose[@]}" exec -T "broker$broker" sh -c 'find /var/lib/rusta/raft -name "snapshot-*" ! -name "*.tmp" | grep -q .'
+}
+for ((attempt=0; attempt<40; attempt++)); do
+    if has_snapshot "$retention_leader"; then break; fi
+    sleep 0.25
+done
+has_snapshot "$retention_leader"
+"${compose[@]}" up -d --wait broker3
+for ((attempt=0; attempt<60; attempt++)); do
+    if has_snapshot 3; then break; fi
+    sleep 0.25
+done
+has_snapshot 3
+"${compose[@]}" exec -T broker3 sh -c '
+    snapshot=$(find /var/lib/rusta/raft -name "snapshot-*" ! -name "*.tmp" | head -1)
+    test ! -e "${snapshot%/*}/00000000000000000001.log"
+'
+"${compose[@]}" exec -T "broker$retention_leader" sh -c '
+    snapshot=$(find /var/lib/rusta/raft -name "snapshot-*" ! -name "*.tmp" | head -1)
+    test ! -e "${snapshot%/*}/00000000000000000001.log"
+'
 "${compose[@]}" kill -s SIGKILL "broker$retention_leader"
 majority=""
 for id in 1 2 3; do

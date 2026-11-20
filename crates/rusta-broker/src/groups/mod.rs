@@ -19,7 +19,7 @@ pub use store::{Completion, Event, Key, Offset, OffsetBudget};
 
 use store::{JOURNAL_RETENTION, LocalStore, Offsets, Store};
 
-const MAX_GROUPS: usize = 256;
+pub const MAX_GROUPS: usize = 256;
 const MAX_MEMBERS: usize = 32;
 const MAX_NODE_MEMBERS: usize = 128;
 const MAX_MEMBER_BYTES: usize = 16 * 1024;

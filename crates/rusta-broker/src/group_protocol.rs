@@ -39,8 +39,9 @@ impl Catalog {
     pub fn leave_group(
         &mut self,
         request: messages::LeaveGroupRequest,
+        version: i16,
     ) -> messages::LeaveGroupResponse {
-        leave_group(&mut self.groups, request)
+        leave_group(&mut self.groups, request, version)
     }
 
     pub fn offset_commit(
@@ -105,7 +106,7 @@ pub fn find_coordinator<'a>(
         resolve_endpoint(key.as_str())
     };
     let mut response = messages::FindCoordinatorResponse::default();
-    if version == 3 {
+    if version <= 3 {
         match resolve(&request.key) {
             Ok((node, endpoint)) => {
                 response.node_id = node;
@@ -139,12 +140,20 @@ pub fn find_coordinator<'a>(
 pub fn leave_group(
     groups: &mut Groups,
     request: messages::LeaveGroupRequest,
+    version: i16,
 ) -> messages::LeaveGroupResponse {
     use messages::leave_group_response::MemberResponse;
     let id = request.group_id.0.as_str();
     if !valid_id(id) {
         return messages::LeaveGroupResponse::default()
             .with_error_code(Error::InvalidGroupId as i16);
+    }
+    if version < 3 {
+        return messages::LeaveGroupResponse::default().with_error_code(code(groups.leave(
+            id,
+            request.member_id.as_str(),
+            false,
+        )));
     }
     let members = request
         .members
@@ -162,6 +171,28 @@ pub fn leave_group(
         })
         .collect();
     messages::LeaveGroupResponse::default().with_members(members)
+}
+
+pub fn join_response(
+    mut response: messages::JoinGroupResponse,
+    version: i16,
+) -> messages::JoinGroupResponse {
+    if version < 7 {
+        response.protocol_type = None;
+        response.protocol_name.get_or_insert_with(StrBytes::default);
+    }
+    response
+}
+
+pub fn sync_response(
+    mut response: messages::SyncGroupResponse,
+    version: i16,
+) -> messages::SyncGroupResponse {
+    if version < 5 {
+        response.protocol_name = None;
+        response.protocol_type = None;
+    }
+    response
 }
 
 pub fn offset_commit(
