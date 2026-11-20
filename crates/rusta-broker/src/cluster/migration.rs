@@ -55,6 +55,10 @@ pub fn check_target(root: &Path) -> Result<()> {
 
 pub fn run(source: &Path, target: &Path, settings: &Settings) -> Result<()> {
     ensure!(
+        !settings.page_cache,
+        "singleton migration requires durable cluster ACK"
+    );
+    ensure!(
         source.join("catalog/manifest").is_file() && !source.join("cluster-identity").exists(),
         "source must be a single-node Rusta volume"
     );
@@ -295,6 +299,8 @@ mod tests {
             cluster: Uuid::new_v4(),
             peers: [Peer::parse("1,raft1:7000,localhost:9092,broker1:29092")?].into(),
             bootstrap_voters: vec![1],
+            page_cache: false,
+            cache_recovery: None,
             staged_peers: Default::default(),
             bind: "127.0.0.1:0".parse()?,
             certificates: scratch.path().join("pki"),

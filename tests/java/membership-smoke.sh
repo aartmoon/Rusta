@@ -8,6 +8,8 @@ project="$(basename "$scratch" | tr '[:upper:]_.' '[:lower:]--')"
 export RUSTA_CLUSTER_PKI="$scratch/pki"
 compose=(docker compose --project-directory "$root" -f "$scratch/compose.yaml" -p "$project")
 worker=""
+build=--build
+if [[ -n "${RUSTA_IMAGE:-}" ]]; then build=--no-build; fi
 cleanup() {
     outcome=$?
     if [ -n "$worker" ]; then kill "$worker" 2>/dev/null || true; fi
@@ -27,7 +29,7 @@ javac -cp "$scratch/deps/*" -d "$scratch" tests/java/{Smoke,GroupSmoke,Membershi
 run() {
     java -Dorg.slf4j.simpleLogger.defaultLogLevel=error -cp "$scratch:$scratch/deps/*" MembershipSmoke "$@" "$scratch"
 }
-"${compose[@]}" up -d --build --wait broker1 broker2 broker3
+"${compose[@]}" up -d "$build" --wait broker1 broker2 broker3
 run setup 127.0.0.1:19392
 run traffic 127.0.0.1:19392 > "$scratch/traffic.log" 2>&1 &
 worker=$!
@@ -37,8 +39,10 @@ for ((attempt=0; attempt<100; attempt++)); do
     sleep 0.1
 done
 test -f "$scratch/ready"
-"${compose[@]}" up -d --wait broker4
+printf 'benchmark-phase expansion_started\n'
+"${compose[@]}" up -d --no-build --wait broker4
 run expanded 127.0.0.1:19395
+printf 'benchmark-phase expansion_completed\n'
 run leadership 127.0.0.1:19395
 source="$(sed -n '1p' "$scratch/transfer")"
 target="$(sed -n '2p' "$scratch/transfer")"
@@ -63,6 +67,7 @@ run transferred 127.0.0.1:19395
 run controller 127.0.0.1:19392
 controller="$(cat "$scratch/controller")"
 request=6e0c4ca8-c1d9-4a76-9b45-a67badbd582d
+printf 'benchmark-phase rebalance_started\n'
 admin "$controller" rebalance "$request" | tee "$scratch/accepted"
 grep -Fq '"result": "accepted"' "$scratch/accepted"
 admin "$controller" rebalance "$request" | tee "$scratch/repeated"
@@ -72,11 +77,11 @@ grep -Fq '"kind": "rebalance"' "$scratch/paused"
 grep -Fq '"to": 4' "$scratch/paused"
 
 "${compose[@]}" kill -s SIGKILL "broker$controller"
-"${compose[@]}" up -d --wait broker4
+"${compose[@]}" up -d --no-build --wait broker4
 run controller 127.0.0.1:19395
 replacement="$(cat "$scratch/controller")"
 test "$replacement" -ne "$controller"
-"${compose[@]}" up -d --wait "broker$controller"
+"${compose[@]}" up -d --no-build --wait "broker$controller"
 for ((attempt=0; attempt<150; attempt++)); do
     admin 4 relocation-status > "$scratch/status"
     if grep -Fq "\"last_rebalance\": \"$request\"" "$scratch/status"; then break; fi
@@ -88,6 +93,7 @@ run controller 127.0.0.1:19395
 controller="$(cat "$scratch/controller")"
 admin "$controller" rebalance "$request" | tee "$scratch/completed"
 grep -Fq '"result": "completed"' "$scratch/completed"
+printf 'benchmark-phase rebalance_completed\n'
 admin "$controller" rebalance 5a7a116f-8edc-417d-9755-d139c293f4fc | tee "$scratch/balanced"
 grep -Fq '"result": "balanced"' "$scratch/balanced"
 
@@ -96,6 +102,6 @@ wait "$worker"
 worker=""
 cat "$scratch/traffic.log"
 "${compose[@]}" kill -s SIGKILL broker4
-"${compose[@]}" up -d --wait broker4
+"${compose[@]}" up -d --no-build --wait broker4
 "${compose[@]}" kill -s SIGKILL broker1
 run verify 127.0.0.1:19395

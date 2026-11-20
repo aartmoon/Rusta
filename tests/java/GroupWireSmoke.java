@@ -27,7 +27,10 @@ public final class GroupWireSmoke {
             return;
         }
 
-        var coordinator = find(args[1], GROUP, 0);
+        int excluded = args[0].equals("recover")
+            ? Integer.parseInt(Files.readString(scratch.resolve("wire-coordinator")))
+            : 0;
+        var coordinator = find(args[1], GROUP, excluded);
         String endpoint = coordinator.endpoint();
         if (args[0].equals("prepare")) {
             for (int version = 6; version <= 9; version++) {

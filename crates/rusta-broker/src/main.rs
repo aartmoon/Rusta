@@ -200,8 +200,8 @@ async fn main() -> Result<()> {
         result = stop => result,
     };
     result?;
-    if worker.cluster.is_some() {
-        return Ok(());
+    if let Some(cluster) = &worker.cluster {
+        return cluster.shutdown().await;
     }
     worker
         .work(|catalog| {

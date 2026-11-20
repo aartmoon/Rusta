@@ -27,8 +27,19 @@ For a cluster, generate and mount [peer certificates](../README.md#run-a-local-c
 | `RUSTA_RAFT_BIND`, `RUSTA_CLUSTER_CERTS`, `RUSTA_CLUSTER_PKI` | Raft bind defaults to `0.0.0.0:7000`. The Compose host path `RUSTA_CLUSTER_PKI` supplies peer pins and keys to `/etc/rusta/pki`. |
 | `RUSTA_GROUP_OFFSET_RETENTION_MS` | 604800000 ms after a group empties. The singleton profile passes it through. Add it to the broker service environment to tune it in a cluster. |
 | `RUSTA_CLUSTER_SNAPSHOT_INTERVAL` | 4096 Raft entries between snapshots. Use a positive integer. |
+| `RUSTA_CLUSTER_ACK_MODE` | `auto` by default. It keeps an existing volume's mode and enables `page-cache` on fresh Linux clusters with at least three bootstrap voters. Set `durable` explicitly when creating a cluster that must sync a majority before every ACK. |
 | `RUSTA_CLUSTER_PRODUCER_RETENTION_MS` | 86400000 ms for inactive cluster producer histories. Configure a positive duration in the broker environment, consistently across peers. |
 | `RUSTA_DEBUG_CONNECTIONS` | Set to `1` temporarily to log Kafka connection errors. |
+
+## Page-cache acknowledgements
+
+Fresh Linux clusters bootstrapped with at least three voters use page-cache acknowledgements by default. For topics with RF3 or higher, Produce waits for the leader and a Raft majority to write to the OS page cache. Topics with RF1 or RF2, controller state, elections and consumer-group offsets retain disk synchronization. Brokers validate the selected mode on startup and when peers exchange Raft messages.
+
+The broker starts flushing dirty partitions after about a second and staggers flushes across partitions. Disk I/O and queueing can extend that interval. A power loss or concurrent loss of cached copies can lose confirmed writes. Producer acknowledgements and consumer offset commits have different persistence boundaries in this mode.
+
+An abrupt broker-process restart can reopen the same volumes while the Linux kernel stays up. After an unclean shutdown and a kernel reboot or host move, buffered partitions reopen from their last synchronized checkpoints. They follow an eligible leader and resume voting after catching up durably. Place replicas on separate hosts so a single host failure leaves two eligible RF3 replicas. If every eligible copy is lost, the affected partition remains unavailable pending recovery from a verified backup.
+
+For a planned host reboot or volume move, stop clients first and use `docker compose -f compose.cluster.yaml stop -t 60` to flush the volumes. To upgrade an older page-cache volume, perform the first restart of the upgraded broker on the same kernel so it can install the synchronized recovery checkpoint. When provisioning a fresh broker in an existing cluster, set its ACK mode to the cluster's active mode.
 
 ## Plan upgrades and scaling
 

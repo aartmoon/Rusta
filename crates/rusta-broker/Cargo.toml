@@ -9,6 +9,7 @@ license.workspace = true
 anyhow = "1"
 bytes = "1"
 crc32c = "0.6.9"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 protobuf = "2.28"
 raft = { version = "0.7.0", default-features = false, features = ["protobuf-codec"] }
 ring = "0.17"

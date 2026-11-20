@@ -58,7 +58,15 @@ impl Checkpoint {
     }
 
     pub fn load(root: &Path) -> io::Result<Self> {
-        let mut file = File::open(root.join(MANIFEST))?;
+        Self::load_named(root, MANIFEST)
+    }
+
+    pub fn load_stable(root: &Path) -> io::Result<Self> {
+        Self::load_named(root, "manifest.stable")
+    }
+
+    fn load_named(root: &Path, name: &str) -> io::Result<Self> {
+        let mut file = File::open(root.join(name))?;
         let mut bytes = [0; CHECKPOINT_LEN];
         if file.metadata()?.len() != CHECKPOINT_LEN as u64 {
             return Err(corrupt("invalid manifest size"));
@@ -91,6 +99,18 @@ impl Checkpoint {
     }
 
     pub fn save(self, root: &Path) -> io::Result<()> {
+        self.write_manifest(root, MANIFEST, true)
+    }
+
+    pub fn save_buffered(self, root: &Path) -> io::Result<()> {
+        self.write_manifest(root, MANIFEST, false)
+    }
+
+    pub fn save_stable(self, root: &Path) -> io::Result<()> {
+        self.write_manifest(root, "manifest.stable", true)
+    }
+
+    fn write_manifest(self, root: &Path, name: &str, sync: bool) -> io::Result<()> {
         let mut bytes = [0; CHECKPOINT_LEN];
         bytes[..8].copy_from_slice(MAGIC);
         for (offset, position) in [(8, self.start), (24, self.durable), (40, self.committed)] {
@@ -101,12 +121,17 @@ impl Checkpoint {
         let checksum = crc32c(&bytes[..64]);
         bytes[64..].copy_from_slice(&checksum.to_be_bytes());
 
-        let temporary = root.join("manifest.tmp");
+        let temporary = root.join(format!("{name}.tmp"));
         let mut file = File::create(&temporary)?;
         file.write_all(&bytes)?;
-        file.sync_all()?;
-        fs::rename(&temporary, root.join(MANIFEST))?;
-        File::open(root)?.sync_all()
+        if sync {
+            file.sync_all()?;
+        }
+        fs::rename(&temporary, root.join(name))?;
+        if sync {
+            File::open(root)?.sync_all()?;
+        }
+        Ok(())
     }
 }
 

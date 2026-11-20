@@ -39,6 +39,8 @@ The multi-platform load requires the containerd image store. The regular CI work
 
 After publication is approved, dispatch **Publish versioned image** on the Git tag matching the Cargo workspace version, such as `v0.1.0`. The workflow runs CI and publishes the semver image tag to GHCR. Use the published digest to reproduce a deployment.
 
+See the [performance report](docs/performance.md) for the comparison with Kafka, Redpanda, Apache Iggy and NATS JetStream, including reproduction commands, raw samples and release gates.
+
 ## Single-node behavior
 
 Create topics explicitly with AdminClient or a Spring Kafka `NewTopic` bean. Consumers can assign partitions manually or subscribe using dynamic classic groups. Group commits persist the next offset, optional metadata and leader epoch. The broker acknowledges them after syncing its group journal. After restart, members rejoin and resume from their last committed positions. `RUSTA_GROUP_OFFSET_RETENTION_MS` defaults to seven days after a group becomes empty.
@@ -57,7 +59,7 @@ scripts/cluster-certs.sh "$RUSTA_CLUSTER_PKI"
 docker compose -f compose.cluster.yaml up -d --build --wait
 ```
 
-Use `127.0.0.1:19092,127.0.0.1:19093,127.0.0.1:19094` as Kafka bootstrap servers. Within the Compose network use `broker1:29092,broker2:29092,broker3:29092`. Broker-to-broker traffic uses mutual TLS with pinned node certificates on a separate network. Create topics with the replication factor you need and use `acks=all`. The leader responds after its own disk and a voting majority have persisted the batch. Fetch and offset lookups use a Raft quorum barrier. A failed or timed-out Produce can have an unknown result, so use an idempotent producer for retries.
+Use `127.0.0.1:19092,127.0.0.1:19093,127.0.0.1:19094` as Kafka bootstrap servers. Within the Compose network use `broker1:29092,broker2:29092,broker3:29092`. Broker-to-broker traffic uses mutual TLS with pinned node certificates on a separate network. Create topics with the replication factor you need and use `acks=all`. Fresh Linux RF3 clusters default to [page-cache acknowledgements](docs/operations.md#page-cache-acknowledgements). For a durable voting majority before each ACK, set `RUSTA_CLUSTER_ACK_MODE=durable` when creating the cluster. Fetch and offset lookups use a Raft quorum barrier. A failed or timed-out Produce can have an unknown result, so use an idempotent producer for retries.
 
 For a different node count, generate a Compose configuration. This example starts five brokers on ports 19092 through 19096.
 

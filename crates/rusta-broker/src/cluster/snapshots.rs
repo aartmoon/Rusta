@@ -213,6 +213,7 @@ impl Engine {
 
     pub(super) fn restore_control(&mut self, state: ControlState) -> Result<()> {
         state.validate(&self.settings)?;
+        self.flush_page_cache()?;
         self.nodes.retain(|key, _| *key == CONTROL);
         self.replicas.clear();
         self.origins.clear();

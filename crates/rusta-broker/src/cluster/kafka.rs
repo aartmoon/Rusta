@@ -1,13 +1,15 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, ensure};
 use bytes::{Bytes, BytesMut};
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use rusta_kafka::{
     Header, Request, api_versions, encode,
     messages::{self, BrokerId, ProducerId, TopicName},
     protocol::StrBytes,
+    records::Batch,
 };
 use tokio::{
     sync::oneshot,
@@ -23,7 +25,7 @@ use crate::{
 
 use super::{
     Cluster,
-    engine::{CONTROL, Engine, GroupId, Node, Write},
+    engine::{CONTROL, Engine, GroupId, Node, ProduceBatch, Write},
 };
 
 pub(super) const DEADLINE: Duration = Duration::from_secs(3);
@@ -44,11 +46,6 @@ pub(super) async fn reply<T>(receiver: oneshot::Receiver<Result<T, Error>>) -> R
         .await
         .map_err(|_| Error::RequestTimedOut)?
         .map_err(|_| Error::Storage)?
-}
-
-enum ProduceOutcome {
-    Complete(Result<i64, Error>),
-    Pending(Write, Instant),
 }
 
 async fn write_result(write: Write, deadline: Instant) -> Result<i64, Error> {
@@ -272,55 +269,71 @@ impl Cluster {
         } else {
             None
         };
-        let repeated_partition = {
-            let mut seen = HashSet::new();
-            request.topic_data.iter().any(|topic| {
-                topic
-                    .partition_data
-                    .iter()
-                    .any(|part| !seen.insert((&topic.name, part.index)))
-            })
-        };
-        // Submit independent partition batches before awaiting their quorum replies.
-        // Preserve the request order when the same partition appears more than once.
-        let mut proposed_topics = Vec::new();
+        let mut responses = Vec::new();
+        let mut writes = HashMap::<_, Vec<_>>::new();
         for topic in request.topic_data {
+            let topic_slot = responses.len();
             let mut partitions = Vec::new();
             for part in topic.partition_data {
-                let index = part.index;
-                let proposed = if let Some(error) = request_error {
-                    Err(error)
+                let partition_slot = partitions.len();
+                let mut result = PartitionProduceResponse::default().with_index(part.index);
+                if let Some(error) = request_error {
+                    result.error_code = error as i16;
                 } else if let Some(records) = part.records {
-                    let name = topic.name.0.as_str().to_owned();
-                    self.call(move |engine| match engine.topic_key(&name, index) {
-                        Ok(key) => engine.produce(key, records),
-                        Err(error) => Ok(Err(error)),
-                    })
-                    .await?
+                    writes
+                        .entry((topic.name.clone(), part.index))
+                        .or_default()
+                        .push((topic_slot, partition_slot, records));
                 } else {
-                    Err(Error::InvalidRecord)
-                };
-                let outcome = match proposed {
-                    Ok(write) if repeated_partition => ProduceOutcome::Complete(
-                        write_result(write, Instant::now() + DEADLINE).await,
-                    ),
-                    Ok(write) => ProduceOutcome::Pending(write, Instant::now() + DEADLINE),
-                    Err(error) => ProduceOutcome::Complete(Err(error)),
-                };
-                partitions.push((index, outcome));
+                    result.error_code = Error::InvalidRecord as i16;
+                }
+                partitions.push(result);
             }
-            proposed_topics.push((topic.name, partitions));
+            responses.push(
+                TopicProduceResponse::default()
+                    .with_name(topic.name)
+                    .with_partition_responses(partitions),
+            );
         }
 
-        let mut responses = Vec::new();
-        for (name, proposed) in proposed_topics {
-            let mut partitions = Vec::new();
-            for (index, outcome) in proposed {
-                let mut result = PartitionProduceResponse::default().with_index(index);
-                let outcome = match outcome {
-                    ProduceOutcome::Complete(completed) => completed,
-                    ProduceOutcome::Pending(write, deadline) => write_result(write, deadline).await,
-                };
+        // A repeated partition only waits for its own previous write.
+        let mut completions: FuturesUnordered<_> = writes
+            .into_iter()
+            .map(|((name, index), writes)| async move {
+                let mut outcomes = Vec::with_capacity(writes.len());
+                for (topic_slot, partition_slot, records) in writes {
+                    let input =
+                        if records.len() <= 64 * 1024 && !Batch::needs_decompression(&records) {
+                            ProduceBatch::inspect(records)
+                        } else {
+                            let slot = self.batch_checks.clone().acquire_owned().await?;
+                            tokio::task::spawn_blocking(move || {
+                                let _slot = slot;
+                                ProduceBatch::inspect(records)
+                            })
+                            .await?
+                        };
+                    let topic = name.clone();
+                    let proposed = self
+                        .call(
+                            move |engine| match engine.topic_key(topic.0.as_str(), index) {
+                                Ok(key) => engine.produce(key, input),
+                                Err(error) => Ok(Err(error)),
+                            },
+                        )
+                        .await?;
+                    let outcome = match proposed {
+                        Ok(write) => write_result(write, Instant::now() + DEADLINE).await,
+                        Err(error) => Err(error),
+                    };
+                    outcomes.push((topic_slot, partition_slot, outcome));
+                }
+                Ok::<_, anyhow::Error>(outcomes)
+            })
+            .collect();
+        while let Some(completed) = completions.next().await {
+            for (topic, partition, outcome) in completed? {
+                let result = &mut responses[topic].partition_responses[partition];
                 match outcome {
                     Ok(offset) => {
                         result.base_offset = offset;
@@ -328,13 +341,7 @@ impl Cluster {
                     }
                     Err(error) => result.error_code = error as i16,
                 }
-                partitions.push(result);
             }
-            responses.push(
-                TopicProduceResponse::default()
-                    .with_name(name)
-                    .with_partition_responses(partitions),
-            );
         }
         Ok(messages::ProduceResponse::default().with_responses(responses))
     }

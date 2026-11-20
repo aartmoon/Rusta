@@ -40,6 +40,8 @@ pub enum Packet {
     Drain,
     Moved(Uuid, Movement),
     PeerReady(Bytes),
+    RecoveryRequest(GroupId, Uuid),
+    RecoveryStart(GroupId, Uuid, u64, u64),
 }
 
 pub struct Queued {
@@ -59,6 +61,8 @@ impl Queued {
             Packet::Leaders(report) | Packet::PeerReady(report) => report.len(),
             Packet::Join | Packet::Drain => 0,
             Packet::Moved(..) => MOVE,
+            Packet::RecoveryRequest(..) => GROUP + 16,
+            Packet::RecoveryStart(..) => GROUP + 32,
         } + HEADER;
         let limit = if matches!(&packet, Packet::Raft(_, message) if message.get_msg_type() == MessageType::MsgSnapshot)
         {
@@ -428,6 +432,16 @@ async fn outbound(
                 Packet::Join => (4, None, Bytes::new()),
                 Packet::Drain => (5, None, Bytes::new()),
                 Packet::PeerReady(data) => (7, None, data.clone()),
+                Packet::RecoveryRequest(key, token) => {
+                    (9, Some(*key), Bytes::copy_from_slice(token.as_bytes()))
+                }
+                Packet::RecoveryStart(key, token, term, committed) => {
+                    let mut data = BytesMut::with_capacity(32);
+                    data.extend_from_slice(token.as_bytes());
+                    data.put_u64(*term);
+                    data.put_u64(*committed);
+                    (10, Some(*key), data.freeze())
+                }
                 Packet::Moved(id, movement) => {
                     let mut body = BytesMut::with_capacity(MOVE);
                     body.extend_from_slice(movement.key.topic.as_bytes());
@@ -590,6 +604,27 @@ async fn inbound(
                 cluster
                     .call(move |engine| {
                         engine.receive_peer_ready(source, ready);
+                        Ok(())
+                    })
+                    .await?;
+            }
+            9 => {
+                ensure!(body.len() == GROUP + 16, "invalid recovery request");
+                let key = group_id(body)?;
+                let token = Uuid::from_slice(&body[GROUP..])?;
+                cluster
+                    .call(move |engine| engine.request_cache_recovery(source, key, token))
+                    .await?;
+            }
+            10 => {
+                ensure!(body.len() == GROUP + 32, "invalid recovery offer");
+                let key = group_id(body)?;
+                let token = Uuid::from_slice(&body[GROUP..GROUP + 16])?;
+                let term = u64::from_be_bytes(body[GROUP + 16..GROUP + 24].try_into()?);
+                let committed = u64::from_be_bytes(body[GROUP + 24..].try_into()?);
+                cluster
+                    .call(move |engine| {
+                        engine.accept_cache_recovery(source, key, token, term, committed);
                         Ok(())
                     })
                     .await?;

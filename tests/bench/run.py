@@ -12,10 +12,25 @@ import time
 root = Path(__file__).resolve().parents[2]
 cgroup_probe = """
 awk '/^VmRSS:|^VmHWM:|^RssAnon:|^RssFile:/{gsub(":","",$1);print $1,$2*1024}' /proc/1/status
+if test -r /proc/1/smaps; then
+    awk '/^[0-9a-f]+-/ {heap=($NF=="[heap]")}
+         heap && /^Rss:/ {kib+=$2}
+         END {print "brk_heap_rss", kib*1024}' /proc/1/smaps
+fi
 awk '{print "broker_ticks", $14+$15}' /proc/1/stat
 printf 'ticks_per_sec '; getconf CLK_TCK
 printf 'cgroup_current '; cat /sys/fs/cgroup/memory.current
 awk '$1=="file"||$1=="anon"||$1=="sock"||$1=="inactive_file"{print $1,$2}' /sys/fs/cgroup/memory.stat
+if test -r /sys/fs/cgroup/memory.peak; then
+    printf 'cgroup_peak '; cat /sys/fs/cgroup/memory.peak
+fi
+awk '{
+    for (i=2; i<=NF; i++) {
+        split($i, pair, "=");
+        totals[pair[1]] += pair[2]
+    }
+} END { print "disk_read_bytes", totals["rbytes"]+0; print "disk_write_bytes", totals["wbytes"]+0;
+        print "disk_read_ios", totals["rios"]+0; print "disk_write_ios", totals["wios"]+0; }' /sys/fs/cgroup/io.stat
 awk '$1=="usage_usec"{print $1,$2}' /sys/fs/cgroup/cpu.stat
 """
 
@@ -30,12 +45,14 @@ def collect(ids, samples, pool):
     data = dict(zip(ids, pool.map(sample, ids.values())))
     samples.append({"t": time.monotonic(), "nodes": data})
 
-def run_phase(mode, topic, payload, ids, seeds, pool):
-    stage = work / f"{mode}-{topic}"
+def run_phase(mode, topic, payload, ids, seeds, pool, *, output=None, settings=None, client=None):
+    output = work if output is None else output
+    settings = args if settings is None else settings
+    stage = output / f"{mode}-{topic}"
     stage.mkdir()
     records = []
-    target = args.rate
-    measured = args.seconds
+    target = settings.rate
+    measured = settings.seconds
     summary = {}
     process = None
     log = stage / "java.log"
@@ -43,9 +60,14 @@ def run_phase(mode, topic, payload, ids, seeds, pool):
         deadline = time.monotonic() + measured
         if payload:
             with log.open("w") as handle:
-                workload = "write" if topic == "write" else "mixed"
-                process = sp.Popen(java(workload, seeds, topic, str(payload), str(target),
-                                        str(measured), str(stage)), stdout=handle, stderr=sp.STDOUT)
+                if client is None:
+                    workload = "write" if topic == "write" else "mixed"
+                    argv = java(workload, seeds, topic, str(payload), str(target),
+                                str(measured), str(stage), str(settings.linger_ms),
+                                str(settings.fetch_max_wait_ms))
+                else:
+                    argv = client(stage)
+                process = sp.Popen(argv, stdout=handle, stderr=sp.STDOUT)
             warmup_deadline = time.monotonic() + 60
             while not (stage / "steady").exists():
                 if process.poll() is not None or time.monotonic() > warmup_deadline:
@@ -79,6 +101,13 @@ def run_phase(mode, topic, payload, ids, seeds, pool):
                 "cgroup_avg_MiB": statistics.mean(n["cgroup_current"] for n in snapshots) / 2**20,
                 "file_cache_end_MiB": last["file"] / 2**20,
                 "cgroup_end_MiB": last["cgroup_current"] / 2**20,
+                "cgroup_peak_MiB": max(n.get("cgroup_peak", n["cgroup_current"]) for n in snapshots) / 2**20,
+                "socket_end_bytes": last.get("sock", 0),
+                "brk_heap_rss_end_bytes": last.get("brk_heap_rss"),
+                "disk_read_bytes": last["disk_read_bytes"] - first["disk_read_bytes"],
+                "disk_write_bytes": last["disk_write_bytes"] - first["disk_write_bytes"],
+                "disk_read_ios": last["disk_read_ios"] - first["disk_read_ios"],
+                "disk_write_ios": last["disk_write_ios"] - first["disk_write_ios"],
             }
         (stage/"samples.json").write_text(json.dumps(records))
         result = {"mode":mode,"scenario":topic,"payload_bytes":payload,"samples":len(records),
@@ -121,7 +150,8 @@ def benchmark(mode, pool, project):
             ids = {name: command(compose + ["ps", "-q", name], env=env,
                                  capture_output=True).stdout.strip() for name in services}
             time.sleep(3)
-            profiles = [("idle", 0), ("write", 1024), ("mix", 1024), ("mix_large", 4096)]
+            profiles = ([("write", 512), ("mix", 1024)] if args.rf3_latency
+                        else [("idle", 0), ("write", 1024), ("mix", 1024), ("mix_large", 4096)])
             return [run_phase(mode, topic, payload, ids, seeds, pool) for topic, payload in profiles]
         finally:
             sp.run(compose + ["logs"], env=env, stdout=log, stderr=sp.STDOUT, timeout=30)
@@ -136,9 +166,15 @@ if __name__ == "__main__":
     parser.add_argument("--base-port", type=int, default=19692)
     parser.add_argument("--rate", type=int, default=2000)
     parser.add_argument("--seconds", type=int, default=16)
+    parser.add_argument("--rf3-latency", action="store_true",
+                        help="measure 512-byte ACK and 1 KiB end-to-end latency on RF3")
+    parser.add_argument("--linger-ms", type=int, default=5)
+    parser.add_argument("--fetch-max-wait-ms", type=int, default=500)
     args = parser.parse_args()
     if not (1024 <= args.base_port <= 65532 and args.rate > 0 and args.seconds >= 4):
         parser.error("use a base port from 1024 to 65532, a positive rate and at least four seconds")
+    if args.linger_ms < 0 or args.fetch_max_wait_ms < 0:
+        parser.error("linger and fetch wait must be nonnegative")
     work = args.output.resolve()
     work.mkdir()
     with tempfile.TemporaryDirectory(prefix="rusta-bench-") as token:
@@ -166,10 +202,15 @@ if __name__ == "__main__":
                                           capture_output=True).stdout.strip()),
                 "target_messages_per_second": args.rate,
                 "seconds": args.seconds,
+                "rf3_latency": args.rf3_latency,
+                "cluster_ack_mode": os.environ.get("RUSTA_CLUSTER_ACK_MODE", "auto"),
+                "producer_linger_ms": args.linger_ms,
+                "consumer_fetch_max_wait_ms": args.fetch_max_wait_ms,
             }
             (work / "environment.json").write_text(json.dumps(metadata, indent=2) + "\n")
             with futures.ThreadPoolExecutor(max_workers=3) as pool:
-                results = benchmark("single", pool, project) + benchmark("rf3", pool, project)
+                results = [] if args.rf3_latency else benchmark("single", pool, project)
+                results += benchmark("rf3", pool, project)
             (work / "results.json").write_text(json.dumps(results, indent=2) + "\n")
         finally:
             if not args.image:

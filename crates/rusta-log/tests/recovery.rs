@@ -6,6 +6,54 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rusta_log::{Options, PartitionLog, Position, Retention};
+
+#[test]
+fn cached_progress_survives_process_reopen_and_can_be_flushed() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut log = PartitionLog::open(dir.path(), Options::default())?;
+    log.enable_page_cache();
+    log.append_batch(1, 100, &batch(&[(100, 1)]))?;
+    let acknowledged = log.commit()?;
+    assert!(log.needs_page_cache_flush());
+    drop(log);
+
+    let mut log = PartitionLog::open(dir.path(), Options::default())?;
+    assert_eq!(log.committed(), acknowledged);
+    log.enable_page_cache();
+    log.flush_page_cache()?;
+    assert!(!log.needs_page_cache_flush());
+    drop(log);
+    let log = PartitionLog::open(dir.path(), Options::default())?;
+    assert_eq!(log.committed(), acknowledged);
+    assert_eq!(log.batch_at(0, &mut Vec::new())?.unwrap().record_count, 1);
+    Ok(())
+}
+
+#[test]
+fn kernel_loss_rolls_back_only_the_buffered_suffix() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut log = PartitionLog::open_page_cached(dir.path(), Options::default(), false)?;
+    log.enable_page_cache();
+    log.append_batch(1, 100, &batch(&[(100, 1)]))?;
+    let stable = log.commit()?;
+    log.flush_page_cache()?;
+    log.append_batch(1, 200, &batch(&[(200, 2)]))?;
+    assert_eq!(log.commit()?.next_offset, 2);
+    drop(log);
+
+    fs::write(dir.path().join("manifest"), b"lost cached manifest")?;
+    let mut log = PartitionLog::open_page_cached(dir.path(), Options::default(), true)?;
+    assert_eq!(log.committed(), stable);
+    assert_eq!(log.end(), stable);
+    log.append_batch(2, 300, &batch(&[(300, 3)]))?;
+    assert_eq!(log.commit()?.next_offset, 2);
+    drop(log);
+
+    let log = PartitionLog::open_page_cached(dir.path(), Options::default(), true)?;
+    assert_eq!(log.committed().next_offset, 2);
+    assert_eq!(log.term(2)?, 2);
+    Ok(())
+}
 use tempfile::TempDir;
 
 fn options(segment_bytes: u64) -> Options {

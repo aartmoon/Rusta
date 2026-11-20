@@ -24,6 +24,8 @@ A singleton uses the same identities, journals and commit model with one voter a
 
 ## Storage and durable commits
 
+Fresh Linux clusters with three bootstrap voters default to page-cache Produce acknowledgments for RF3 data partitions. A voting majority including the leader must append before acknowledgment. A replica that loses its kernel cache enters recovery and waits for the live quorum to restore its log before voting again. The controller and consumer offsets use durable progress. See the [acknowledgment and recovery policy](operations.md#page-cache-acknowledgements).
+
 The first implementation lives in `crates/rusta-log`. Its checkpoint records the retained start, durable end, committed end and term before the retained range. Recovery validates the durable prefix and discards bytes beyond it. Time lookup narrows the search with segment and batch bounds and calls a record decoder for the exact match. The storage iteration tests that boundary with Kafka v2 fixtures. Full compressed-record admission, coordinator state and networked Raft remain later integration work. The on-disk format is provisional during the Raft adapter spike.
 
 A topic ID and partition number identify a directory containing a versioned manifest, immutable sealed segments and one active segment. Each data entry stores a length-delimited, checksummed envelope with Raft index and term and one Kafka record batch. Internal entries, including configuration changes and retention commands, consume Raft indexes. Kafka offsets count user records. Maintain a mapping between the two index spaces. A data append writes the payload once to the on-disk replicated log. The Raft adapter reads bounded slices from this storage. No second full payload journal is required.

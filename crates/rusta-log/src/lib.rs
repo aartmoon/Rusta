@@ -47,6 +47,9 @@ pub struct PartitionLog {
     checkpoint: Checkpoint,
     segments: Vec<Segment>,
     writer: Option<File>,
+    page_cache: bool,
+    needs_flush: bool,
+    stable_manifest: bool,
     failed: bool,
     _lock: File,
 }
@@ -54,17 +57,31 @@ pub struct PartitionLog {
 impl PartitionLog {
     /// Open a partition. Its parent directory must already exist.
     pub fn open(root: impl AsRef<Path>, options: Options) -> io::Result<Self> {
+        Self::open_inner(root.as_ref(), options, None)
+    }
+
+    /// Open a replica whose buffered progress is protected by a kernel boot fence.
+    /// After kernel loss only the separately synchronized manifest is trusted.
+    pub fn open_page_cached(
+        root: impl AsRef<Path>,
+        options: Options,
+        recover_from_disk: bool,
+    ) -> io::Result<Self> {
+        Self::open_inner(root.as_ref(), options, Some(recover_from_disk))
+    }
+
+    fn open_inner(root: &Path, options: Options, cache: Option<bool>) -> io::Result<Self> {
         if options.segment_bytes < HEADER_LEN
             || options.max_entry_bytes == 0
             || options.max_entry_bytes > MAX_PAYLOAD
         {
             return Err(invalid("invalid segment size or entry size limit"));
         }
-        let root = root.as_ref().canonicalize().or_else(|error| {
+        let root = root.canonicalize().or_else(|error| {
             if error.kind() != ErrorKind::NotFound {
                 return Err(error);
             }
-            let requested = root.as_ref();
+            let requested = root;
             match fs::create_dir(requested) {
                 Ok(()) => {}
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
@@ -84,7 +101,32 @@ impl PartitionLog {
         }
 
         let indexes = list(&root)?;
-        let checkpoint = match Checkpoint::load(&root) {
+        let stable = cache
+            .map(|_| Checkpoint::load_stable(&root))
+            .transpose()
+            .or_else(|error| {
+                if error.kind() == ErrorKind::NotFound {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            })?;
+        let checkpoint = match if let (Some(true), Some(stable)) = (cache, stable) {
+            Ok(stable)
+        } else {
+            Checkpoint::load(&root)
+        } {
+            Ok(checkpoint)
+                if cache == Some(true)
+                    && stable.is_none()
+                    && !(indexes.is_empty()
+                        && checkpoint.durable == Position::initial()
+                        && checkpoint.start == Position::initial()) =>
+            {
+                return Err(corrupt(
+                    "page-cache replica has no synchronized recovery manifest",
+                ));
+            }
             Ok(checkpoint) => checkpoint,
             Err(error) if error.kind() == ErrorKind::NotFound && indexes.is_empty() => {
                 let checkpoint = Checkpoint::initial();
@@ -93,20 +135,51 @@ impl PartitionLog {
             }
             Err(error) => return Err(error),
         };
+        if cache == Some(true) {
+            checkpoint.save(&root)?;
+        }
         let segments = recover(&root, checkpoint, &indexes)?;
-        Ok(Self {
+        let mut log = Self {
             root,
             options,
             checkpoint,
             segments,
             writer: None,
+            page_cache: false,
+            needs_flush: false,
+            stable_manifest: cache.is_some(),
             failed: false,
             _lock: lock,
-        })
+        };
+        if cache.is_some() && stable.is_none() {
+            log.needs_flush = true;
+            log.flush_page_cache()?;
+        }
+        Ok(log)
     }
 
     pub fn start(&self) -> Position {
         self.checkpoint.start
+    }
+
+    /// The caller must fence any reopened volume whose kernel cache could
+    /// have been lost. Normal checkpoint and retention operations stay durable.
+    pub fn enable_page_cache(&mut self) {
+        self.page_cache = true;
+        // An earlier process on the same boot may have left data in cache.
+        self.needs_flush = true;
+    }
+
+    pub fn needs_page_cache_flush(&self) -> bool {
+        self.needs_flush
+    }
+
+    pub fn flush_page_cache(&mut self) -> io::Result<()> {
+        self.ensure_available()?;
+        if self.needs_flush {
+            self.mutate(|log| log.save(log.checkpoint))?;
+        }
+        Ok(())
     }
 
     pub fn committed(&self) -> Position {
@@ -236,33 +309,46 @@ impl PartitionLog {
 
     /// Make staged writes recoverable without making them visible to readers.
     pub fn sync(&mut self) -> io::Result<Position> {
-        self.sync_boundary(false)
+        self.sync_boundary(None)
     }
 
     /// Sync and publish all local writes in one checkpoint. For single-voter use.
     pub fn commit(&mut self) -> io::Result<Position> {
-        self.sync_boundary(true)
+        self.sync_and_commit_through(self.end().next_index)
     }
 
-    fn sync_boundary(&mut self, commit: bool) -> io::Result<Position> {
+    /// Sync staged writes and publish the prefix already committed by consensus.
+    pub fn sync_and_commit_through(&mut self, next_index: u64) -> io::Result<Position> {
+        if !(self.committed().next_index..=self.end().next_index).contains(&next_index) {
+            return Err(invalid("commit must extend the staged prefix"));
+        }
+        self.sync_boundary(Some(next_index))?;
+        Ok(self.committed())
+    }
+
+    fn sync_boundary(&mut self, committed: Option<u64>) -> io::Result<Position> {
         self.ensure_available()?;
         let end = self.end();
-        if self.durable() == end && (!commit || self.committed() == end) {
+        let committed = committed
+            .filter(|&index| index != self.committed().next_index)
+            .map(|index| self.position_at(index))
+            .transpose()?
+            .unwrap_or(self.committed());
+        if self.durable() == end && self.committed() == committed {
             return Ok(end);
         }
         self.mutate(|log| {
-            if log.durable() != end {
+            if log.durable() != end && !log.page_cache {
                 log.writer
                     .as_ref()
                     .expect("staged writes have an open writer")
                     .sync_data()?;
             }
-            let mut checkpoint = log.checkpoint;
-            checkpoint.durable = end;
-            if commit {
-                checkpoint.committed = end;
-            }
-            log.save(checkpoint)?;
+            log.save_progress(Checkpoint {
+                durable: end,
+                committed,
+                ..log.checkpoint
+            })?;
             Ok(end)
         })
     }
@@ -279,7 +365,7 @@ impl PartitionLog {
         }
         let committed = self.position_at(next_index)?;
         self.mutate(|log| {
-            log.save(Checkpoint {
+            log.save_progress(Checkpoint {
                 committed,
                 ..log.checkpoint
             })?;
@@ -705,9 +791,33 @@ impl PartitionLog {
     }
 
     fn save(&mut self, checkpoint: Checkpoint) -> io::Result<()> {
+        if self.needs_flush {
+            if let Some(segment) = self.segments.last() {
+                if let Some(writer) = &self.writer {
+                    writer.sync_data()?;
+                } else {
+                    File::open(path(&self.root, segment.start.next_index))?.sync_all()?;
+                }
+            }
+            self.needs_flush = false;
+        }
         checkpoint.save(&self.root)?;
+        if self.stable_manifest {
+            checkpoint.save_stable(&self.root)?;
+        }
         self.checkpoint = checkpoint;
         Ok(())
+    }
+
+    fn save_progress(&mut self, checkpoint: Checkpoint) -> io::Result<()> {
+        if self.page_cache {
+            checkpoint.save_buffered(&self.root)?;
+            self.checkpoint = checkpoint;
+            self.needs_flush = true;
+            Ok(())
+        } else {
+            self.save(checkpoint)
+        }
     }
 
     fn ensure_available(&self) -> io::Result<()> {

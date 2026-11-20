@@ -37,6 +37,7 @@ x-broker: &broker
     retries: 10
 
 x-env: &cluster-env
+  RUSTA_CLUSTER_ACK_MODE: \${RUSTA_CLUSTER_ACK_MODE:-auto}
   RUSTA_CLUSTER_ID: \${RUSTA_CLUSTER_ID:-4e90dcf1-72c1-491e-99a1-72d58be78c35}
   RUSTA_CLUSTER_PEERS: "$peers"
   RUSTA_CLUSTER_CERTS: /etc/rusta/pki

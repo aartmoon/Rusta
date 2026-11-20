@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -32,8 +32,11 @@ use super::{
 
 #[path = "migration.rs"]
 pub mod migration;
+#[path = "recovery.rs"]
+mod recovery;
 #[path = "snapshots.rs"]
 mod snapshots;
+use recovery::RecoveryOffer;
 use snapshots::{ControlState, GroupState};
 
 type Reply<T> = oneshot::Receiver<Result<T, Error>>;
@@ -51,6 +54,9 @@ pub const CONTROL: GroupId = GroupId {
 };
 
 const GROUP_SHARDS: usize = 4;
+const MAX_PENDING_BATCHES: usize = 4;
+const MAX_UNCOMMITTED_BYTES: usize = 2 * MAX_BATCH;
+const PAGE_CACHE_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
 fn group_shard(index: usize) -> GroupId {
     GroupId {
@@ -141,16 +147,21 @@ pub struct Engine {
     compaction_cursor: Option<GroupId>,
     internal_snapshot_interval: u64,
     rebuilding_catalog: bool,
+    pub(super) closing: bool,
 }
 
 pub struct Node {
     raw: RawNode<Disk>,
-    pending: Option<Pending>,
+    pending: VecDeque<Pending>,
     reads: HashMap<Vec<u8>, Read>,
     committed_term: u64,
     group: Option<GroupShard>,
     fetch_leadership: (u64, u64),
     snapshot_deadlines: HashMap<u64, Instant>,
+    cache_flushed_at: Option<Instant>,
+    recovering: bool,
+    recovery_offer: Option<RecoveryOffer>,
+    recovery_requests: HashMap<u64, (Uuid, u64)>,
 }
 
 struct Pending {
@@ -158,6 +169,8 @@ struct Pending {
     term: u64,
     reply: oneshot::Sender<Result<i64, Error>>,
     offset: i64,
+    batch: Option<Batch>,
+    bytes: usize,
 }
 
 struct Read {
@@ -263,6 +276,7 @@ impl Engine {
             last_report: Instant::now(),
             join_requests: BTreeMap::new(),
             next_barrier: 0,
+            closing: false,
             next_producer: counter + 1,
             reserved_producer: counter,
             data,
@@ -438,8 +452,10 @@ impl Engine {
                     .find(|id| **id == movement.from)
                     .context("missing source replica")?;
                 *source = movement.to;
-                if self.settings.id == movement.from {
-                    self.nodes.remove(&movement.key);
+                if self.settings.id == movement.from
+                    && let Some(mut node) = self.nodes.remove(&movement.key)
+                {
+                    node.raw.mut_store().log.flush_page_cache()?;
                 }
                 if self
                     .leaders
@@ -1048,7 +1064,7 @@ impl Engine {
         Ok(Ok(reply))
     }
 
-    pub fn produce(&mut self, key: GroupId, records: Bytes) -> Result<Result<Write, Error>> {
+    pub fn produce(&mut self, key: GroupId, input: ProduceBatch) -> Result<Result<Write, Error>> {
         // Give a ready membership change the admission slot between batches.
         if let Some(movement) = self.relocation.as_ref().and_then(RelocationPlan::active)
             && movement.key == key
@@ -1065,22 +1081,17 @@ impl Engine {
         if node.leader() != self.settings.id {
             return Ok(Err(Error::NotLeader));
         }
-        if !node.admitting() {
-            return Ok(Err(Error::RequestTimedOut));
-        }
-        if records.len() > MAX_BATCH {
+        if input.records.len() > MAX_BATCH {
             return Ok(Err(Error::MessageTooLarge));
         }
-        let batch = match Batch::parse(&records) {
+        if !node.admitting_data(input.records.len() + 9) {
+            return Ok(Err(Error::RequestTimedOut));
+        }
+        let batch = match input.checked {
             Ok(batch) => batch,
-            Err(_) => return Ok(Err(Error::CorruptMessage)),
+            Err(error) => return Ok(Err(error)),
         };
-        if !batch.compression_is_supported() {
-            return Ok(Err(Error::UnsupportedCompression));
-        }
-        if batch.scan(&records, i64::MAX).is_err() {
-            return Ok(Err(Error::InvalidRecord));
-        }
+        let records = input.records;
         if batch.producer > 0 {
             let broker = (batch.producer as u64) & 255;
             if batch.producer > self.imported_producer_floor
@@ -1091,7 +1102,11 @@ impl Engine {
             if batch.epoch != 0 {
                 return Ok(Err(Error::InvalidProducerEpoch));
             }
-            match node.raw.store().producers.check(batch) {
+            let staged = node
+                .pending
+                .iter()
+                .filter_map(|pending| pending.batch.map(|batch| (batch, pending.offset)));
+            match node.raw.store().producers.check_staged(batch, staged) {
                 Ok(None) => {}
                 Ok(Some(offset)) => {
                     return self.read(key).map(|authorized| {
@@ -1112,7 +1127,7 @@ impl Engine {
         bytes.put_i32(epoch);
         bytes.extend_from_slice(&records[16..]);
         let timestamp = groups::now_ms().max(1) as i64;
-        let reply = node.propose(encode_batch(timestamp, &bytes), offset)?;
+        let reply = node.propose_entry(encode_batch(timestamp, &bytes), offset, Some(batch))?;
         self.drain(key)?;
         Ok(Ok(Write::Pending(reply)))
     }
@@ -1401,7 +1416,9 @@ impl Engine {
                         true
                     }
                 });
-                node.raw.tick();
+                if !node.recovering {
+                    node.raw.tick();
+                }
                 self.drain(key)?;
                 if is_group_shard(key) {
                     let term = self.nodes[&key].raw.raft.term;
@@ -1409,8 +1426,27 @@ impl Engine {
                 }
             }
         }
+        if self.settings.page_cache {
+            // Spread the timed flushes so a burst of dirty partitions does
+            // not force every partition to wait behind one long flush loop.
+            let now = Instant::now();
+            if let Some(node) = self
+                .nodes
+                .values_mut()
+                .filter(|node| {
+                    node.cache_flushed_at
+                        .is_some_and(|last| now.duration_since(last) >= PAGE_CACHE_FLUSH_INTERVAL)
+                        && node.raw.store().log.needs_page_cache_flush()
+                })
+                .min_by_key(|node| node.cache_flushed_at)
+            {
+                node.raw.mut_store().log.flush_page_cache()?;
+                node.cache_flushed_at = Some(Instant::now());
+            }
+        }
         if self.last_report.elapsed() >= Duration::from_millis(250) {
             self.last_report = Instant::now();
+            self.drive_cache_recovery()?;
             let requested = self
                 .data
                 .parent()
@@ -1467,6 +1503,13 @@ impl Engine {
                     Queued::send(queue, &self.send_bytes, Packet::Leaders(report.clone()));
                 }
             }
+        }
+        Ok(())
+    }
+
+    pub(super) fn flush_page_cache(&mut self) -> Result<()> {
+        for node in self.nodes.values_mut() {
+            node.raw.mut_store().log.flush_page_cache()?;
         }
         Ok(())
     }
@@ -1577,6 +1620,9 @@ impl Engine {
             return Ok(());
         }
         if let Some(node) = self.nodes.get_mut(&key) {
+            if node.recovering && !node.accepts_recovery_append(&message) {
+                return Ok(());
+            }
             if message.get_msg_type() == MessageType::MsgSnapshot {
                 let snapshot = message.get_snapshot();
                 let checked = node
@@ -1617,6 +1663,9 @@ impl Engine {
             // A transport response can be obsolete after a leadership change.
             let _ = node.raw.step(message);
             self.drain(key)?;
+            if let Some(node) = self.nodes.get_mut(&key) {
+                node.check_recovery_progress();
+            }
         }
         Ok(())
     }
@@ -1636,9 +1685,35 @@ impl Engine {
         let mut control_snapshot = None;
         while node.raw.has_ready() {
             let mut ready = node.raw.ready();
+            let mut messages = ready.take_messages();
+            if !key.topic.is_nil()
+                && destination.is_none()
+                && node.committed_term == node.raw.raft.term
+                && ready.snapshot().is_empty()
+                && !ready.entries().is_empty()
+            {
+                // Raft allows these leader appends to overlap local persistence.
+                // Persisted messages and client replies still wait for the disk.
+                let early = messages
+                    .iter()
+                    .take_while(|message| {
+                        message.get_msg_type() == MessageType::MsgAppend
+                            && !message.entries.is_empty()
+                            && message
+                                .entries
+                                .iter()
+                                .all(|entry| entry.get_entry_type() == EntryType::EntryNormal)
+                            && self.outbound.contains_key(&message.to)
+                    })
+                    .count();
+                for message in messages.drain(..early) {
+                    let queue = &self.outbound[&message.to];
+                    Queued::send(queue, &self.send_bytes, Packet::Raft(key, message));
+                }
+            }
             let snapshot = (!ready.snapshot().is_empty()).then_some(ready.snapshot());
             let snapshot_index = if let Some(snapshot) = snapshot {
-                node.raw.mut_store().persist(ready.hs(), &[])?;
+                node.raw.mut_store().persist(ready.hs(), &[], None)?;
                 node.raw
                     .mut_store()
                     .install_snapshot(snapshot, self.settings.id)?;
@@ -1653,12 +1728,15 @@ impl Engine {
             } else {
                 None
             };
-            node.raw.mut_store().persist(ready.hs(), ready.entries())?;
+            let committed = ready
+                .committed_entries()
+                .last()
+                .map(|entry| entry.index + 1);
+            node.raw
+                .mut_store()
+                .persist(ready.hs(), ready.entries(), committed)?;
             let mut committed = ready.take_committed_entries();
-            let messages = ready
-                .take_messages()
-                .into_iter()
-                .chain(ready.take_persisted_messages());
+            let messages = messages.into_iter().chain(ready.take_persisted_messages());
             let states = ready.take_read_states();
             let mut light = node.raw.advance_append(ready);
             committed.extend(light.take_committed_entries());
@@ -1690,10 +1768,10 @@ impl Engine {
                 }
                 if node
                     .pending
-                    .as_ref()
+                    .front()
                     .is_some_and(|p| p.term == entry.term && p.index == entry.index)
                 {
-                    let pending = node.pending.take().expect("matching pending entry");
+                    let pending = node.pending.pop_front().expect("matching pending entry");
                     completed_term = Some(pending.term);
                     completions.push(pending);
                 }
@@ -1731,11 +1809,12 @@ impl Engine {
         let term = node.raw.raft.term;
         if node
             .pending
-            .as_ref()
+            .front()
             .is_some_and(|pending| !local_leader || pending.term != term)
         {
-            let pending = node.pending.take().expect("old pending entry");
-            let _ = pending.reply.send(Err(Error::NotLeader));
+            for pending in node.pending.drain(..) {
+                let _ = pending.reply.send(Err(Error::NotLeader));
+            }
         }
         if let Some(shard) = &mut node.group {
             let previous_term = shard.active.as_ref().map(|(term, _)| *term);
@@ -1883,6 +1962,32 @@ pub enum Write {
     Pending(Reply<i64>),
 }
 
+pub(super) struct ProduceBatch {
+    records: Bytes,
+    checked: Result<Batch, Error>,
+}
+
+impl ProduceBatch {
+    pub(super) fn inspect(records: Bytes) -> Self {
+        let checked = if records.len() > MAX_BATCH {
+            Err(Error::MessageTooLarge)
+        } else {
+            Batch::parse(&records)
+                .map_err(|_| Error::CorruptMessage)
+                .and_then(|batch| {
+                    if !batch.compression_is_supported() {
+                        return Err(Error::UnsupportedCompression);
+                    }
+                    batch
+                        .scan(&records, i64::MAX)
+                        .map_err(|_| Error::InvalidRecord)?;
+                    Ok(batch)
+                })
+        };
+        Self { records, checked }
+    }
+}
+
 impl Node {
     fn open(
         settings: &Settings,
@@ -1891,12 +1996,19 @@ impl Node {
         key: GroupId,
         initial_offset: i64,
     ) -> Result<Self> {
-        let disk = Disk::open(
+        let cache = settings.page_cache && !key.topic.is_nil() && voters.len() >= 3;
+        let recovering = cache && settings.cache_recovery.is_some();
+        let mut disk = Disk::open_replica(
             path,
             voters,
             key == CONTROL || is_group_shard(key),
             initial_offset,
+            cache.then_some(recovering),
         )?;
+        if cache && !recovering {
+            disk.log.enable_page_cache();
+        }
+        let cache_flushed_at = cache.then(Instant::now);
         let group = if is_group_shard(key) {
             let mut committed = disk
                 .internal_state::<GroupState>()?
@@ -1936,7 +2048,7 @@ impl Node {
             max_size_per_msg: MAX_BATCH as u64 + 4096,
             max_inflight_msgs: 4,
             max_committed_size_per_ready: 2 * MAX_BATCH as u64,
-            max_uncommitted_size: 2 * MAX_BATCH as u64,
+            max_uncommitted_size: MAX_UNCOMMITTED_BYTES as u64,
             ..Config::default()
         };
         config.validate()?;
@@ -1947,12 +2059,16 @@ impl Node {
         )?;
         Ok(Self {
             raw,
-            pending: None,
+            pending: VecDeque::new(),
             reads: HashMap::new(),
             committed_term,
             group,
             fetch_leadership: (0, 0),
             snapshot_deadlines: HashMap::new(),
+            cache_flushed_at,
+            recovering,
+            recovery_offer: None,
+            recovery_requests: HashMap::new(),
         })
     }
 
@@ -2007,20 +2123,49 @@ impl Node {
         self.local_leader()
             && self.raw.raft.lead_transferee.is_none()
             && self.committed_term == self.raw.raft.term
-            && self.pending.is_none()
+            && self.pending.is_empty()
             && self.log().end() == self.log().committed()
     }
 
+    fn admitting_data(&self, bytes: usize) -> bool {
+        self.local_leader()
+            && self.raw.raft.lead_transferee.is_none()
+            && self.committed_term == self.raw.raft.term
+            && self.pending.len() < MAX_PENDING_BATCHES
+            && self.pending.iter().all(|pending| pending.batch.is_some())
+            && self.log().end().next_index
+                == self.log().committed().next_index + self.pending.len() as u64
+            && self
+                .pending
+                .iter()
+                .map(|pending| pending.bytes)
+                .sum::<usize>()
+                + bytes
+                <= MAX_UNCOMMITTED_BYTES
+    }
+
     fn propose(&mut self, bytes: Vec<u8>, offset: i64) -> Result<Reply<i64>> {
+        self.propose_entry(bytes, offset, None)
+    }
+
+    fn propose_entry(
+        &mut self,
+        bytes: Vec<u8>,
+        offset: i64,
+        batch: Option<Batch>,
+    ) -> Result<Reply<i64>> {
         let (reply, receiver) = oneshot::channel();
         let index = self.raw.store().last_index()? + 1;
         let term = self.raw.raft.term;
+        let length = bytes.len();
         self.raw.propose(Vec::new(), bytes)?;
-        self.pending = Some(Pending {
+        self.pending.push_back(Pending {
             index,
             term,
             reply,
             offset,
+            batch,
+            bytes: length,
         });
         Ok(receiver)
     }
@@ -2058,6 +2203,128 @@ mod tests {
 
     const GROUP: &str = "fault-test";
 
+    #[test]
+    fn partition_pipelines_ordered_batches_without_early_ack() -> Result<()> {
+        let mut cluster = TestCluster::open()?;
+        cluster.leader()?;
+        let key = GroupId {
+            topic: Uuid::new_v4(),
+            partition: 0,
+        };
+        let controller = cluster
+            .brokers
+            .iter_mut()
+            .flatten()
+            .find(|broker| broker.controller())
+            .expect("controller elected");
+        controller
+            .create(
+                TopicConfig {
+                    name: "pipeline".into(),
+                    id: key.topic,
+                    partitions: 1,
+                    allow_weak_acks: false,
+                    retention_ms: None,
+                    retention_bytes: None,
+                    legacy_retention_since_ms: None,
+                },
+                3,
+            )?
+            .expect("topic proposed");
+        cluster.pump()?;
+        let mut leader = None;
+        for _ in 0..150 {
+            for broker in cluster.brokers.iter_mut().flatten() {
+                broker.tick()?;
+            }
+            cluster.pump()?;
+            leader = cluster.brokers.iter().position(|broker| {
+                broker
+                    .as_ref()
+                    .unwrap()
+                    .nodes
+                    .get(&key)
+                    .is_some_and(Node::admitting)
+            });
+            if leader.is_some() {
+                break;
+            }
+        }
+        let leader = leader.expect("partition leader elected");
+        let make_batch = |sequence: i32| {
+            let mut batch = vec![0u8; 61];
+            batch.extend_from_slice(&[12, 0, 0, 0, 1, 1, 0]);
+            let length = batch.len() as i32 - 12;
+            batch[8..12].copy_from_slice(&length.to_be_bytes());
+            batch[16] = 2;
+            batch[43..51].copy_from_slice(&257_i64.to_be_bytes());
+            batch[53..57].copy_from_slice(&sequence.to_be_bytes());
+            batch[57..61].copy_from_slice(&1_i32.to_be_bytes());
+            let crc = crc32c::crc32c(&batch[21..]);
+            batch[17..21].copy_from_slice(&crc.to_be_bytes());
+            ProduceBatch::inspect(Bytes::from(batch))
+        };
+        let broker = cluster.brokers[leader].as_mut().unwrap();
+        let mut replies = Vec::new();
+        for sequence in 0..MAX_PENDING_BATCHES as i32 {
+            let Write::Pending(mut reply) = broker.produce(key, make_batch(sequence))?.unwrap()
+            else {
+                panic!("new batch must be proposed");
+            };
+            assert!(matches!(reply.try_recv(), Err(TryRecvError::Empty)));
+            if sequence == 0 {
+                assert!(matches!(
+                    broker.produce(key, make_batch(sequence))?,
+                    Err(Error::RequestTimedOut)
+                ));
+            }
+            replies.push(reply);
+        }
+        assert!(matches!(
+            broker.produce(key, make_batch(MAX_PENDING_BATCHES as i32))?,
+            Err(Error::RequestTimedOut)
+        ));
+        assert_eq!(broker.nodes[&key].log().committed().next_offset, 0);
+        cluster.pump()?;
+        for (offset, reply) in replies.iter_mut().enumerate() {
+            assert_eq!(reply.try_recv()?.unwrap(), offset as i64);
+        }
+        let broker = cluster.brokers[leader].as_mut().unwrap();
+        let Write::Existing(offset, mut barrier) = broker.produce(key, make_batch(0))?.unwrap()
+        else {
+            panic!("committed retry must reuse the original offset");
+        };
+        cluster.pump()?;
+        assert_eq!(offset, 0);
+        barrier.try_recv()?.unwrap();
+
+        let broker = cluster.brokers[leader].as_mut().unwrap();
+        let mut unconfirmed = Vec::new();
+        for sequence in MAX_PENDING_BATCHES..MAX_PENDING_BATCHES + 2 {
+            let Write::Pending(reply) = broker.produce(key, make_batch(sequence as i32))?.unwrap()
+            else {
+                panic!("new batch must be proposed");
+            };
+            unconfirmed.push(reply);
+        }
+        let mut heartbeat = Message {
+            from: ((leader + 1) % 3 + 1) as u64,
+            to: broker.settings.id,
+            term: broker.nodes[&key].raw.raft.term + 1,
+            ..Message::default()
+        };
+        heartbeat.set_msg_type(MessageType::MsgHeartbeat);
+        broker.receive(key, heartbeat)?;
+        for reply in &mut unconfirmed {
+            assert!(matches!(reply.try_recv()?, Err(Error::NotLeader)));
+        }
+        assert_eq!(
+            broker.nodes[&key].log().committed().next_offset,
+            MAX_PENDING_BATCHES as i64
+        );
+        Ok(())
+    }
+
     type Outbound = HashMap<u64, tokio::sync::mpsc::Receiver<Queued>>;
 
     struct TestCluster {
@@ -2093,6 +2360,8 @@ mod tests {
                     cluster,
                     peers: peers.clone(),
                     bootstrap_voters: vec![1, 2, 3],
+                    page_cache: false,
+                    cache_recovery: None,
                     staged_peers: BTreeMap::new(),
                     bind: "127.0.0.1:0".parse()?,
                     certificates: PathBuf::new(),
@@ -2297,7 +2566,7 @@ mod tests {
         cluster.pump_until(|cluster| {
             cluster.brokers[leader].as_ref().unwrap().nodes[&key]
                 .pending
-                .is_none()
+                .is_empty()
         })?;
         let node = &cluster.brokers[leader].as_ref().unwrap().nodes[&key];
         let next_index = node.log().committed().next_index;

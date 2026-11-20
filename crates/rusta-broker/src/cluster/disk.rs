@@ -129,19 +129,31 @@ impl Recovered {
 }
 
 impl Disk {
+    #[cfg(test)]
     pub fn open(
         root: &Path,
         peers: Vec<u64>,
         internal_entries: bool,
         initial_offset: i64,
     ) -> Result<Self> {
-        let mut log = PartitionLog::open(
-            root,
-            Options {
-                max_entry_bytes: MAX_BATCH,
-                ..Options::default()
-            },
-        )?;
+        Self::open_replica(root, peers, internal_entries, initial_offset, None)
+    }
+
+    pub fn open_replica(
+        root: &Path,
+        peers: Vec<u64>,
+        internal_entries: bool,
+        initial_offset: i64,
+        cache: Option<bool>,
+    ) -> Result<Self> {
+        let options = Options {
+            max_entry_bytes: MAX_BATCH,
+            ..Options::default()
+        };
+        let mut log = match cache {
+            Some(recover) => PartitionLog::open_page_cached(root, options, recover)?,
+            None => PartitionLog::open(root, options)?,
+        };
         if log.start().next_index == 1 {
             log.initialize_offset(initial_offset)?;
         }
@@ -205,7 +217,12 @@ impl Disk {
         Ok(log)
     }
 
-    pub fn persist(&mut self, election: Option<&HardState>, entries: &[Entry]) -> Result<()> {
+    pub fn persist(
+        &mut self,
+        election: Option<&HardState>,
+        entries: &[Entry],
+        committed: Option<u64>,
+    ) -> Result<()> {
         // Persist term and vote before entries. A crash may leave a newer term
         // with an older log, while it must never leave an entry from a future term.
         if let Some(state) = election {
@@ -264,8 +281,16 @@ impl Disk {
                 self.log.append_batch(entry.term, timestamp, batch)?;
             }
         }
-        if !entries.is_empty() {
+        if let Some(index) = committed {
+            self.log.sync_and_commit_through(index)?;
+        } else if !entries.is_empty() {
             self.log.sync()?;
+        }
+        if entries
+            .iter()
+            .any(|entry| entry.get_entry_type() == EntryType::EntryConfChange)
+        {
+            self.log.flush_page_cache()?;
         }
         Ok(())
     }
@@ -815,12 +840,11 @@ mod tests {
                 ..HardState::default()
             }),
             &[entry(1, batch.clone())],
+            Some(2),
         )?;
-        disk.log.commit_through(2)?;
         disk.apply_data(1, &batch)?;
         let clock = disk.producers.maintenance_record(100, 50).unwrap();
-        disk.persist(None, &[entry(2, clock.clone())])?;
-        disk.log.commit_through(3)?;
+        disk.persist(None, &[entry(2, clock.clone())], Some(3))?;
         disk.apply_data(2, &clock)?;
         DataCheckpoint::save(
             &path,
@@ -831,7 +855,7 @@ mod tests {
         )?;
 
         let retirement = disk.producers.maintenance_record(150, 50).unwrap();
-        disk.persist(None, &[entry(3, retirement.clone())])?;
+        disk.persist(None, &[entry(3, retirement.clone())], None)?;
         drop(disk);
 
         let mut disk = Disk::open(&path, vec![1, 2, 3], false, 0)?;
@@ -882,8 +906,8 @@ mod tests {
                 data: data.clone().into(),
                 ..Entry::default()
             }],
+            Some(2),
         )?;
-        disk.log.commit_through(2)?;
         let boundary = disk.log.committed();
         let marker = encode_retention(boundary);
         disk.persist(
@@ -894,6 +918,7 @@ mod tests {
                 data: marker.clone().into(),
                 ..Entry::default()
             }],
+            None,
         )?;
         assert_eq!(disk.log.durable().next_index, 3);
         drop(disk);
@@ -926,6 +951,7 @@ mod tests {
                 ..HardState::default()
             }),
             &[],
+            None,
         )?;
         let mut corrupt = snapshot.clone();
         let mut data = corrupt.get_data().to_vec();
@@ -944,8 +970,7 @@ mod tests {
         replica.install_snapshot(&snapshot, 4)?;
         assert!(replica.install_snapshot(&snapshot, 4).is_err());
         let suffix = disk.entries(2, 3, None, GetEntriesContext::empty(false))?;
-        replica.persist(None, &suffix)?;
-        replica.log.commit_through(3)?;
+        replica.persist(None, &suffix, Some(3))?;
         replica.apply_data(2, &marker)?;
         drop(replica);
         let replica = Disk::open(&replica_path, vec![1, 2, 3], false, 0)?;

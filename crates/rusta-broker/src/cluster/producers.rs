@@ -105,6 +105,48 @@ impl Producers {
         Ok(None)
     }
 
+    pub fn check_staged(
+        &self,
+        batch: Batch,
+        staged: impl Iterator<Item = (Batch, i64)>,
+    ) -> Result<Option<i64>, Error> {
+        let mut history = History::default();
+        let mut advanced = false;
+        let mut reserved = Vec::new();
+        let is_new = !self.active.contains_key(&batch.producer);
+        for (pending, offset) in staged {
+            if pending.producer == batch.producer {
+                history.add(pending, offset);
+                advanced = true;
+            } else if is_new
+                && pending.producer > 0
+                && !self.active.contains_key(&pending.producer)
+                && !reserved.contains(&pending.producer)
+            {
+                reserved.push(pending.producer);
+            }
+        }
+        if advanced {
+            if batch.sequence == history.next_sequence {
+                return Ok(None);
+            }
+            if history.find(batch).is_some() {
+                return Err(Error::RequestTimedOut);
+            }
+            return self
+                .active
+                .get(&batch.producer)
+                .and_then(|state| state.history.find(batch))
+                .map(Some)
+                .ok_or(Error::OutOfOrderSequence);
+        }
+        let result = self.check(batch)?;
+        if is_new && self.active.len() + reserved.len() >= MAX_PRODUCER_STATES {
+            return Err(Error::PolicyViolation);
+        }
+        Ok(result)
+    }
+
     fn fenced(&self, id: i64) -> bool {
         self.retired_through
             .get(&(id as u8))

@@ -32,6 +32,8 @@ pub struct Settings {
     pub cluster: Uuid,
     pub peers: BTreeMap<u64, Peer>,
     pub bootstrap_voters: Vec<u64>,
+    page_cache: bool,
+    cache_recovery: Option<Uuid>,
     staged_peers: BTreeMap<u64, [u8; 32]>,
     bind: SocketAddr,
     certificates: PathBuf,
@@ -47,6 +49,8 @@ pub struct Peer {
 }
 
 const STAGED_PEERS: &str = "staged-peers.json";
+const PAGE_CACHE_BOOT: &str = "page-cache-boot";
+const PAGE_CACHE_RECOVERY: &str = "page-cache-recovering";
 const MAX_INVENTORY_BYTES: u64 = 512 * 1024;
 
 #[derive(Deserialize, Serialize)]
@@ -143,11 +147,26 @@ impl Settings {
             .unwrap_or_else(|_| "0.0.0.0:7000".to_owned())
             .parse()?;
         let certificates = PathBuf::from(std::env::var("RUSTA_CLUSTER_CERTS")?);
+        let page_cache = match std::env::var("RUSTA_CLUSTER_ACK_MODE") {
+            Ok(mode) if mode == "page-cache" => {
+                ensure!(cfg!(target_os = "linux"), "page-cache ACK requires Linux");
+                ensure!(
+                    bootstrap_voters.len() >= 3,
+                    "page-cache ACK requires at least three bootstrap voters"
+                );
+                true
+            }
+            Ok(mode) if mode == "durable" || mode == "auto" => false,
+            Err(std::env::VarError::NotPresent) => false,
+            _ => anyhow::bail!("RUSTA_CLUSTER_ACK_MODE must be auto, durable or page-cache"),
+        };
         Ok(Some(Self {
             id,
             cluster,
             peers,
             bootstrap_voters,
+            page_cache,
+            cache_recovery: None,
             staged_peers: BTreeMap::new(),
             bind,
             certificates,
@@ -191,6 +210,7 @@ impl Settings {
         );
         let _lock = crate::lock_data(root).context("stop this broker before changing peer pins")?;
         migration::check_target(root)?;
+        self.select_ack_mode(root)?;
         self.ensure_identity(root)?;
         let mut staged = load_staged_peers(root)?;
         self.merge_staged_peers(&staged)?;
@@ -208,6 +228,9 @@ impl Settings {
         for id in self.bootstrap_voters.iter().map(|id| *id as usize) {
             mask[id / 8] |= 1 << (id % 8);
         }
+        // Node IDs start at one. Mark the previously unused bit so peers
+        // reject incompatible acknowledgement policies before stepping Raft.
+        mask[0] |= u8::from(self.page_cache);
         mask
     }
 
@@ -216,11 +239,15 @@ impl Settings {
             !root.join("catalog").exists(),
             "single-node data requires an explicit cluster migration"
         );
-        let identity = serde_json::to_vec(&(self.cluster, self.id, &self.bootstrap_voters))?;
+        let identity = if self.page_cache {
+            serde_json::to_vec(&(self.cluster, self.id, &self.bootstrap_voters, "page-cache"))?
+        } else {
+            serde_json::to_vec(&(self.cluster, self.id, &self.bootstrap_voters))?
+        };
         match std::fs::read(root.join("cluster-identity")) {
             Ok(previous) => ensure!(
                 previous == identity,
-                "volume identity does not match the cluster and node"
+                "volume identity does not match the cluster, node or acknowledgement mode"
             ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 ensure!(
@@ -233,6 +260,60 @@ impl Settings {
         }
         Ok(())
     }
+
+    fn select_ack_mode(&mut self, root: &Path) -> Result<()> {
+        if std::env::var_os("RUSTA_CLUSTER_ACK_MODE").is_some_and(|mode| mode != "auto") {
+            return Ok(());
+        }
+        self.page_cache = match std::fs::read(root.join("cluster-identity")) {
+            Ok(bytes) => serde_json::from_slice::<(Uuid, u64, Vec<u64>, String)>(&bytes)
+                .is_ok_and(|(_, _, _, mode)| mode == "page-cache"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                cfg!(target_os = "linux") && self.bootstrap_voters.len() >= 3
+            }
+            Err(error) => return Err(error.into()),
+        };
+        ensure!(
+            !self.page_cache || cfg!(target_os = "linux"),
+            "page-cache ACK requires Linux"
+        );
+        Ok(())
+    }
+}
+
+fn activate_page_cache(root: &Path, boot_id: Uuid) -> Result<Option<Uuid>> {
+    let previous = match std::fs::read(root.join(PAGE_CACHE_BOOT)) {
+        Ok(previous) => Some(previous),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let changed = previous
+        .as_deref()
+        .is_some_and(|old| old != boot_id.as_bytes());
+    let recovering = root.join(PAGE_CACHE_RECOVERY).try_exists()?;
+    if changed && !recovering {
+        disk::replace(root, PAGE_CACHE_RECOVERY, b"reconcile\n")?;
+    }
+    if previous.is_none() {
+        // A previous binary recognizes this marker and should also refuse
+        // a volume whose automatic recovery has not finished.
+        let marker = if recovering { Uuid::nil() } else { boot_id };
+        disk::replace(root, PAGE_CACHE_BOOT, marker.as_bytes())?;
+    }
+    Ok((changed || recovering).then(Uuid::new_v4))
+}
+
+fn kernel_boot_id() -> Result<Uuid> {
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .context("read kernel boot identity for page-cache ACK")?;
+    Ok(boot_id.trim().parse()?)
+}
+
+fn finish_page_cache_recovery(root: &Path, boot_id: Uuid) -> Result<()> {
+    disk::replace(root, PAGE_CACHE_BOOT, boot_id.as_bytes())?;
+    std::fs::remove_file(root.join(PAGE_CACHE_RECOVERY))?;
+    std::fs::File::open(root)?.sync_all()?;
+    Ok(())
 }
 
 fn endpoint(value: &str) -> Result<Endpoint> {
@@ -250,10 +331,12 @@ fn endpoint(value: &str) -> Result<Endpoint> {
 pub struct Cluster {
     engine: Mutex<Option<Engine>>,
     worker: Arc<Semaphore>,
+    batch_checks: Arc<Semaphore>,
     data_available: Arc<Notify>,
     group_progress: Arc<Notify>,
     fetch_waiters: Semaphore,
     transport: transport::Routes,
+    page_cache: bool,
     root: PathBuf,
 }
 
@@ -274,7 +357,12 @@ pub fn request_decommission(root: &Path) -> Result<()> {
 
 impl Cluster {
     pub async fn start(mut settings: Settings, root: &Path) -> Result<Arc<Self>> {
+        settings.select_ack_mode(root)?;
         settings.ensure_identity(root)?;
+        let page_cache = settings.page_cache;
+        if page_cache {
+            settings.cache_recovery = activate_page_cache(root, kernel_boot_id()?)?;
+        }
         settings.apply_staged_peers(root)?;
         let tls = transport::Tls::load(&settings)?;
         let routes = transport::Routes::new(&settings, tls);
@@ -286,7 +374,9 @@ impl Cluster {
             fetch_waiters: Semaphore::new(crate::WAITING_FETCHES),
             engine: Mutex::new(Some(node)),
             worker: Arc::new(Semaphore::new(1)),
+            batch_checks: Arc::new(Semaphore::new(2)),
             transport: routes,
+            page_cache,
             root: root.to_owned(),
         });
         cluster.transport.listen(&settings, cluster.clone()).await?;
@@ -358,6 +448,7 @@ impl Cluster {
             let engine = slot
                 .as_mut()
                 .context("cluster is out of service after a state error")?;
+            ensure!(!engine.closing, "cluster is shutting down");
             match work(engine) {
                 Ok(value) => Ok(value),
                 Err(error) => {
@@ -368,5 +459,45 @@ impl Cluster {
             }
         })
         .await?
+    }
+
+    pub async fn shutdown(self: &Arc<Self>) -> Result<()> {
+        if !self.page_cache {
+            return Ok(());
+        }
+        let root = self.root.clone();
+        self.call(move |engine| {
+            engine.closing = true;
+            engine.flush_page_cache()?;
+            if engine.settings.cache_recovery.is_none() {
+                std::fs::remove_file(root.join(PAGE_CACHE_BOOT))?;
+                std::fs::File::open(root)?.sync_all()?;
+            }
+            Ok(())
+        })
+        .await
+    }
+}
+
+#[cfg(test)]
+mod page_cache_tests {
+    use super::*;
+
+    #[test]
+    fn cache_guard_persists_recovery_across_process_restarts() -> Result<()> {
+        let volume = tempfile::tempdir()?;
+        let original = Uuid::new_v4();
+        let rebooted = Uuid::new_v4();
+        assert!(activate_page_cache(volume.path(), original)?.is_none());
+        assert!(activate_page_cache(volume.path(), original)?.is_none());
+        assert!(activate_page_cache(volume.path(), rebooted)?.is_some());
+        assert!(activate_page_cache(volume.path(), rebooted)?.is_some());
+        assert_eq!(
+            std::fs::read(volume.path().join(PAGE_CACHE_BOOT))?,
+            original.as_bytes()
+        );
+        finish_page_cache_recovery(volume.path(), rebooted)?;
+        assert!(activate_page_cache(volume.path(), rebooted)?.is_none());
+        Ok(())
     }
 }

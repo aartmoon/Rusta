@@ -9,7 +9,7 @@ Cluster topics default to RF3 when at least three brokers are configured and sup
 | 0 | Produce | 9–11 | Kafka record-batch v2, keys, values, headers, CreateTime, five codec modes, optional weaker ACKs, producer sequence validation and deduplication |
 | 1 | Fetch | 12–13 | Consumer fetch by name in v12 or topic ID in v13. Full requests with no server-side incremental fetch sessions, committed-prefix visibility and bounded long polling |
 | 2 | ListOffsets | 6–7 | Earliest, latest and timestamp lookup on the retained range |
-| 3 | Metadata | 9–12 | Bootstrap and router endpoints, topics, IDs, partition leaders and leader epochs. Honor topic-ID requests where defined. Report assigned replicas and observed in-sync replicas, with durable-majority acknowledgement defined separately |
+| 3 | Metadata | 9–12 | Bootstrap and router endpoints, topics, IDs, partition leaders and leader epochs. Honor topic-ID requests where defined. Report assigned replicas and observed in-sync replicas, with [quorum acknowledgement modes](operations.md#page-cache-acknowledgements) defined separately |
 | 8 | OffsetCommit | 8–9 | Managed classic generation checks and manual assignment. Durable commits in the group partition |
 | 9 | OffsetFetch | 6–9 | Per-group and batched supported forms. Return committed offsets and metadata |
 | 10 | FindCoordinator | 2–4 | Classic group coordinators, including batched lookup in v4 |

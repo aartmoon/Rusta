@@ -511,6 +511,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "crc32c",
+ "futures-util",
  "protobuf",
  "raft",
  "ring",

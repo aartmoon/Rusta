@@ -40,6 +40,11 @@ fn take_batch(bytes: &mut &[u8]) -> Result<usize> {
 }
 
 impl Batch {
+    /// Decide whether validation might expand a compressed batch.
+    pub fn needs_decompression(bytes: &[u8]) -> bool {
+        bytes.get(22).is_some_and(|attributes| attributes & 7 != 0)
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let mut rest = bytes;
         take_batch(&mut rest)?;
