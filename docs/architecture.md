@@ -1,6 +1,6 @@
 # Rusta architecture proposal
 
-**Status:** Single-node storage, Kafka traffic and classic groups are implemented. The current cluster uses configurable bootstrap voters and supports hot addition of preauthorized nodes and online decommission with replica relocation. The controller and partition replica sets have separate quorums. The remaining cluster sections describe the release design. Numerical tuning defaults in this document are starting points for implementation and measurement.
+**Status:** Single-node storage, Kafka traffic and classic groups are implemented. The cluster supports distributed classic groups, configurable bootstrap voters, hot addition of preauthorized nodes and online decommission with replica relocation. The controller and partition replica sets have separate quorums. The remaining cluster sections describe the release design. Numerical tuning defaults in this document are starting points for implementation and measurement.
 
 Rusta is an Apache-2.0 Rust broker with a native Kafka TCP endpoint, a segmented disk log and no mandatory external service. Release artifacts are versioned images in GHCR for `linux/amd64` and `linux/arm64`. The same image and binary run a singleton or a cluster. The [Kafka API contract](kafka-api.md) defines the first release's client surface.
 
@@ -42,14 +42,33 @@ After a crash, read the last valid manifest, validate the journal and rebuild mi
 
 Retention advances a replicated log-start offset on sealed segment boundaries. Raft log compaction can discard obsolete consensus entries only after a durable checkpoint. A checkpoint includes the applied Raft index and term, high watermark, retained log range, current membership and producer state. A learner whose required entries have been compacted receives a checksummed snapshot and its retained segments in bounded chunks, then catches up on the live suffix. Staging becomes active only after files and manifest are durable. Bound staging disk usage and snapshot lifetimes. If retention overtakes a transfer, retry from a newer snapshot. Active readers hold a bounded reference to each file they use while a concurrent retention pass unlinks obsolete segments.
 
+## Cluster retention boundary
+
+Each user partition has a Kafka-visible start and a physical Raft log start.
+A partition leader selects a committed segment boundary and proposes the
+next Raft index and Kafka offset as an internal entry. Replicas validate the
+position against their committed prefix and recover it on replay. Time-based
+retention uses the original leader's append timestamp carried in the Raft
+entry. Size-based retention keeps the last segment. Earliest offset, timestamp
+search and Fetch use the Kafka-visible start. Leader epoch lookups use the
+preserved history and clamp end offsets to the visible range.
+
+Physical retention requires a recoverable state snapshot and a follower install
+path. A snapshot must bind its last included index and term to membership, the
+Kafka retained range and the state needed to validate idempotent retries.
+Controller and group snapshots also need their applied metadata or committed
+offsets and generation fences. Stage and validate bounded chunks before
+publishing the new checkpoint. Preserve the prior checkpoint and history
+until publication succeeds.
+
 ## Kafka reads, producer retries and group state
 
 - **Reads.** In cluster mode the leader uses Raft Safe ReadIndex and serves only after applying through the returned index. A long-poll `Fetch` joins a fresh barrier when it becomes ready to return. Requests already queued can share a barrier started after they enrolled. A disconnected minority cannot authorize fresh client reads. Reads already authorized at a quorum may complete after a network fault. Singleton reads use the local committed boundary. The initial server handles full Fetch requests with session ID 0. Codecs, wire limits and error cases are specified in the [API contract](kafka-api.md). [Raft Safe ReadIndex](https://docs.rs/raft/latest/raft/enum.ReadOnlyOption.html)
 - **Visibility and ordering.** Fetch returns complete batches below the committed high watermark. The first eligible batch may exceed a caller's requested fetch size to allow progress. The broker reserves bytes for that case before responding. Key routing follows the client's Kafka partitioner. Replica reassignment leaves the partition and its offsets intact. A non-idempotent producer retry can create duplicates and parallel retries can change the order in which its sends reach the partition.
 - **Weaker writes.** Topics configured to allow `acks=1` respond after the leader completes the local append. An allowed `acks=0` sends no response. Both may be lost before durable commit. Disallowed `acks=1` returns the configured policy error. Disallowed `acks=0` may close the connection and writes nothing to that partition. The topic-wide switch never weakens `acks=all`. All modes apply the same committed-read visibility.
 - **Idempotent writes.** Allocate producer IDs through durable controller ranges. For each producer and partition track the epoch, next sequence and recent accepted batch ranges and their original offsets. Keep up to five recent batches for Kafka's in-flight retry window. Coalesce duplicates of pending appends. Reject gaps and stale epochs. Rebuild deduplication state from checkpoints and logs after recovery and before serving writes after election. Expiry and retirement are replicated. A request for forgotten state uses the Kafka recovery error path to renew producer state. It is not accepted as a duplicate or silently appended under the old sequence. State has a hard admission budget and must not be evicted in a way that makes a stale retry match a new producer.
-- **Classic groups.** Hash group ID to an internal partition whose leader acts as coordinator. Its Raft log persists stable generations, assignments and committed offsets. Keep transient joins and heartbeat deadlines in memory with bounded limits. On leadership change fence pending operations from the old coordinator and require members to rejoin when liveness is uncertain. Eager and cooperative assignment stays in the clients. The coordinator implements their classic generation and join/sync rules and rejects stale managed commits. Also support the Kafka offset path for an explicitly assigned consumer without a managed generation. Group-internal partitions start with a small fixed count and migrate with the data partitions.
-- **Offset retention.** An empty group retains offsets for seven days by default. The active coordinator proposes expiration through the replicated log after checking the current stable state. Expiration cannot delete a newer commit because the tombstone checks its expected version. Fetch below the retained start or with a missing committed offset follows the client's configured reset behavior. End-to-end at-least-once requires the consumer application to commit after processing and tolerate repeats.
+- **Classic groups.** Hash group ID to an internal partition whose leader acts as coordinator. Its Raft log persists stable generations, assignments and committed offsets. Keep transient joins and heartbeat deadlines in memory with bounded limits. On leadership change fence pending operations from the old coordinator and require members to rejoin when liveness is uncertain. Eager and cooperative assignment stays in the clients. The coordinator implements their classic generation and join/sync rules and rejects stale managed commits. Also support the Kafka offset path for an explicitly assigned consumer without a managed generation. Four internal group shards migrate alongside user partitions. [Distributed classic consumer groups](cluster-groups.md)
+- **Offset retention.** An empty group retains offsets for seven days by default. The active coordinator proposes expiration through the replicated log after checking the current stable state. The coordinator serializes expiration and commits on each shard, and expiration is proposed only against applied state with no pending proposal. Fetch below the retained start or with a missing committed offset follows the client's configured reset behavior. End-to-end at-least-once requires the consumer application to commit after processing and tolerate repeats.
 
 The single-node coordinator uses a local segmented journal for group generations and offset commits. Its checksummed checkpoint preserves offsets and generation fences before old journal segments are removed. Membership liveness is re-established by a new join after restart, while consumers resume from their committed offsets.
 
@@ -66,7 +85,32 @@ The controller persists reassignment intent. For each move, add a learner, strea
 
 The current decommission command persists its request on the departing broker and sends it over the authenticated peer transport. The controller commits the move plan and serializes partition moves. Each partition commits separate single-member Raft changes for learner addition, promotion and removal. The temporary voting set contains both the source and the replacement, so each transition has overlapping majorities. The partition leader checks durable progress on the replacement and a majority of the surviving voters before removal. The controller publishes the new placement only after a surviving partition leader reports the committed membership. It removes the departing controller voter after all partition moves finish and records the retired broker ID in the controller log. Recovery replays both logs and continues the active plan. The transfer currently uses the retained log.
 
-For singleton conversion, quiesce client traffic, sync and capture the durable boundaries and cluster metadata. Add two peers, keep the original cluster ID, topic IDs and Kafka offsets, and copy partition and coordinator state including producer retry state. Change the controller and data memberships through persisted transitions. Resume traffic once safety checks show the target configuration is durable. Persist the migration phase and fence normal singleton startup after conversion starts. An interruption must resume from the last persisted phase. An offline copy is useful for rollback only via an explicit recovery procedure that ensures the previous volume and converted cluster are never active together.
+An operator-requested rebalance uses the same relocation state machine. It
+balances replica counts across committed controller voters and retains each
+partition's replication factor. The controller commits the full plan before
+accepting it, and a plan UUID scopes partition progress reports. Decommission
+and rebalance share one active plan and relocate one replica at a time.
+Learner append traffic has an 8 MiB/s per-leader budget and a 3 MiB burst.
+
+Cluster operators query committed placement progress and request rebalance or
+leader transfer through a local Unix socket in the broker's private data
+directory. The controller accepts rebalances. The partition leader starts
+explicit transfer after checking that the target is a caught-up voter. The
+caller observes the requested leader before success. A committed rebalance
+resumes after restart or a destination outage.
+
+Future peer inventory changes must bind the node ID, advertised endpoints and
+certificate pin in committed controller state before the node joins as a
+learner. The live transport needs to apply the same authorization to incoming
+and outgoing connections. Certificate issuance and rotation policy remain
+operator decisions.
+
+For singleton conversion, quiesce client traffic, sync and capture the durable boundaries and cluster metadata. Add two peers, keep the original cluster ID, topic IDs and Kafka offsets, and copy partition and coordinator state including producer retry state. Change the controller and data memberships through persisted transitions. Resume traffic once safety checks show the target configuration is durable. Persist the migration phase and fence normal singleton startup after conversion starts. An interruption must resume from the last persisted phase. Import needs to seed the retained offset base and producer retry checkpoints
+when singleton retention has already removed earlier records. The importer
+also needs to reserve the singleton producer ID range because cluster
+allocation encodes the originating broker ID.
+
+An offline copy is useful for rollback only via an explicit recovery procedure that ensures the previous volume and converted cluster are never active together.
 
 ## Memory and overload
 

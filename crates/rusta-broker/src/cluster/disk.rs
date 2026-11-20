@@ -9,16 +9,19 @@ use raft::{
     GetEntriesContext, RaftState, Storage, StorageError,
     eraftpb::{ConfChange, ConfChangeType, ConfState, Entry, EntryType, HardState, Snapshot},
 };
-use rusta_log::{Options, PartitionLog};
+use rusta_log::{Options, PartitionLog, Position};
 
 use crate::partition::MAX_BATCH;
 
 const STATE_MAGIC: &[u8; 8] = b"RUSTAR01";
+const TIMESTAMPED_BATCH: u8 = 254;
+const RETAINED_START: u8 = 253;
 const MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
 
 pub struct Disk {
     pub log: PartitionLog,
-    pub control: bool,
+    pub retained: Position,
+    internal_entries: bool,
     root: PathBuf,
     pub membership: ConfState,
     election: (u64, u64),
@@ -28,7 +31,7 @@ impl Disk {
     pub fn open(
         root: &Path,
         peers: Vec<u64>,
-        control: bool,
+        internal_entries: bool,
         mut recover_batch: impl FnMut(rusta_log::Entry, &[u8]) -> io::Result<()>,
     ) -> Result<Self> {
         let log = PartitionLog::open(
@@ -43,6 +46,7 @@ impl Disk {
         ensure!(election.0 >= last, "persistent Raft term is below log term");
         let mut voters: BTreeSet<_> = peers.into_iter().collect();
         let mut learners = BTreeSet::new();
+        let mut retained = log.start();
         let mut next = log.start().next_index;
         let end = log.committed().next_index;
         while next < end {
@@ -50,7 +54,10 @@ impl Disk {
                 if entry.record_count > 0 {
                     return recover_batch(entry, payload);
                 }
-                if let Some(change) = decode_change(payload).map_err(io::Error::other)? {
+                if !internal_entries && payload.first() == Some(&RETAINED_START) {
+                    retained = check_retention(&log, retained, entry.position.next_index, payload)
+                        .map_err(io::Error::other)?;
+                } else if let Some(change) = decode_change(payload).map_err(io::Error::other)? {
                     match change.get_change_type() {
                         ConfChangeType::AddLearnerNode => {
                             if !voters.contains(&change.node_id) {
@@ -75,7 +82,8 @@ impl Disk {
         membership.set_learners(learners.into_iter().collect());
         Ok(Self {
             log,
-            control,
+            retained,
+            internal_entries,
             root: root.to_owned(),
             membership,
             election,
@@ -120,10 +128,14 @@ impl Disk {
                 data.push(255);
                 data.extend_from_slice(&entry.data);
                 self.log.append_internal(entry.term, 0, &data)?;
-            } else if self.control || entry.data.is_empty() {
+            } else if self.internal_entries
+                || entry.data.is_empty()
+                || entry.data.first() == Some(&RETAINED_START)
+            {
                 self.log.append_internal(entry.term, 0, &entry.data)?;
             } else {
-                self.log.append_batch(entry.term, 0, &entry.data)?;
+                let (timestamp, batch) = decode_batch(&entry.data)?;
+                self.log.append_batch(entry.term, timestamp, batch)?;
             }
         }
         if !entries.is_empty() {
@@ -131,6 +143,64 @@ impl Disk {
         }
         Ok(())
     }
+    /// Apply a committed data-partition entry, returning its batch if it carries records.
+    pub fn apply_data<'a>(&mut self, index: u64, data: &'a [u8]) -> Result<Option<&'a [u8]>> {
+        if data.first() == Some(&RETAINED_START) {
+            self.retained = check_retention(&self.log, self.retained, index, data)?;
+            return Ok(None);
+        }
+        Ok(Some(decode_batch(data)?.1))
+    }
+}
+
+pub fn encode_batch(timestamp: i64, batch: &[u8]) -> Vec<u8> {
+    if timestamp == 0 {
+        return batch.to_vec();
+    }
+    let mut bytes = Vec::with_capacity(9 + batch.len());
+    bytes.push(TIMESTAMPED_BATCH);
+    bytes.extend_from_slice(&timestamp.to_be_bytes());
+    bytes.extend_from_slice(batch);
+    bytes
+}
+
+fn decode_batch(data: &[u8]) -> Result<(i64, &[u8])> {
+    if data.first() != Some(&TIMESTAMPED_BATCH) {
+        return Ok((0, data));
+    }
+    ensure!(data.len() > 9, "truncated timestamped batch");
+    let timestamp = i64::from_be_bytes(data[1..9].try_into()?);
+    ensure!(timestamp > 0, "invalid Raft append timestamp");
+    Ok((timestamp, &data[9..]))
+}
+
+pub fn encode_retention(start: Position) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(17);
+    bytes.push(RETAINED_START);
+    bytes.extend_from_slice(&start.next_index.to_be_bytes());
+    bytes.extend_from_slice(&start.next_offset.to_be_bytes());
+    bytes
+}
+
+fn check_retention(
+    log: &PartitionLog,
+    previous: Position,
+    index: u64,
+    data: &[u8],
+) -> Result<Position> {
+    ensure!(data.len() == 17, "invalid retained start record");
+    let start = Position {
+        next_index: u64::from_be_bytes(data[1..9].try_into()?),
+        next_offset: i64::from_be_bytes(data[9..].try_into()?),
+    };
+    ensure!(
+        start.next_index > previous.next_index
+            && start.next_index <= index
+            && start.next_offset > previous.next_offset
+            && log.position_at(start.next_index)? == start,
+        "invalid retained log boundary"
+    );
+    Ok(start)
 }
 
 pub fn decode_change(bytes: &[u8]) -> Result<Option<ConfChange>> {
@@ -184,6 +254,8 @@ impl Storage for Disk {
                     if stored.record_count == 0 && bytes.first() == Some(&255) {
                         entry.set_entry_type(EntryType::EntryConfChange);
                         entry.set_data(bytes[1..].to_vec().into());
+                    } else if stored.record_count > 0 {
+                        entry.set_data(encode_batch(stored.append_timestamp_ms, bytes).into());
                     } else {
                         entry.set_data(bytes.to_vec().into());
                     }
@@ -257,4 +329,66 @@ fn save_election(root: &Path, election: (u64, u64)) -> Result<()> {
     data.extend_from_slice(&crc32c::crc32c(&data).to_be_bytes());
     replace(root, "election", &data)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_ignores_durable_uncommitted_retention() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("partition");
+        let mut disk = Disk::open(&path, vec![1, 2, 3], false, |_, _| Ok(()))?;
+        let initial = disk.retained;
+        let mut batch = vec![0_u8; 61];
+        batch[8..12].copy_from_slice(&49_i32.to_be_bytes());
+        batch[16] = 2;
+        batch[57..61].copy_from_slice(&1_i32.to_be_bytes());
+        let checksum = crc32c::crc32c(&batch[21..]);
+        batch[17..21].copy_from_slice(&checksum.to_be_bytes());
+        let data = encode_batch(100, &batch);
+        disk.persist(
+            Some(&HardState {
+                term: 1,
+                ..HardState::default()
+            }),
+            &[Entry {
+                index: 1,
+                term: 1,
+                data: data.clone().into(),
+                ..Entry::default()
+            }],
+        )?;
+        disk.log.commit_through(2)?;
+        let boundary = disk.log.committed();
+        let marker = encode_retention(boundary);
+        disk.persist(
+            None,
+            &[Entry {
+                index: 2,
+                term: 1,
+                data: marker.clone().into(),
+                ..Entry::default()
+            }],
+        )?;
+        assert_eq!(disk.log.durable().next_index, 3);
+        drop(disk);
+
+        let mut disk = Disk::open(&path, vec![1, 2, 3], false, |_, _| Ok(()))?;
+        assert_eq!(disk.retained, initial);
+        assert_eq!(disk.log.committed(), boundary);
+        let entries = disk.entries(1, 3, None, GetEntriesContext::empty(false))?;
+        assert_eq!(entries[0].data.as_ref(), data.as_slice());
+        assert_eq!(entries[1].data.as_ref(), marker.as_slice());
+        disk.log.commit_through(3)?;
+        assert!(disk.apply_data(2, &marker)?.is_none());
+        assert_eq!(disk.retained, boundary);
+        drop(disk);
+
+        let disk = Disk::open(&path, vec![1, 2, 3], false, |_, _| Ok(()))?;
+        assert_eq!(disk.retained, boundary);
+        assert_eq!(disk.log.start(), initial);
+        Ok(())
+    }
 }

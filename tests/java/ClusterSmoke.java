@@ -105,20 +105,23 @@ public final class ClusterSmoke {
 
     private static int waitLeader(String bootstrap, int previous) throws Exception {
         long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
-        try (var admin = Admin.create(GroupSmoke.base(bootstrap))) {
-            while (System.nanoTime() < deadline) {
+        var request = MetadataRequest.Builder.allTopics().build((short) 12);
+        while (System.nanoTime() < deadline) {
+            for (var endpoint : bootstrap.split(",")) {
                 try {
-                    var topic = admin.describeTopics(List.of(TOPIC)).allTopicNames().get(3, TimeUnit.SECONDS).get(TOPIC);
-                    var partition = topic.partitions().get(0);
-                    GroupSmoke.check(partition.replicas().size() == 3, "partition was not assigned RF3");
-                    if (partition.leader() != null && partition.leader().id() > 0 && partition.leader().id() != previous) {
-                        return partition.leader().id();
+                    var metadata = ((MetadataResponse) Smoke.exchange(endpoint, request, 1)).data();
+                    var topic = metadata.topics().find(TOPIC);
+                    if (topic == null || topic.partitions().isEmpty()) continue;
+                    var partition = topic.partitions().getFirst();
+                    GroupSmoke.check(partition.replicaNodes().size() == 3, "partition was not assigned RF3");
+                    if (partition.leaderId() > 0 && partition.leaderId() != previous) {
+                        return partition.leaderId();
                     }
-                } catch (java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException retry) {
-                    // New elections can temporarily make Metadata unavailable.
+                } catch (java.io.IOException disconnected) {
+                    // A seed can be down while the surviving brokers hold an election.
                 }
-                Thread.sleep(100);
             }
+            Thread.sleep(100);
         }
         throw new AssertionError("no replacement leader for node " + previous);
     }

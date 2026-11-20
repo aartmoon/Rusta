@@ -51,9 +51,13 @@ docker compose --project-directory "$PWD" -f "$RUSTA_CLUSTER_PKI/compose.yaml" -
 
 A new cluster accepts 1–255 configured node IDs. By default, its controller starts with the full roster. Topic replication factors can range from 1 to the number of brokers, with a default of three or the node count if smaller. Each partition uses its assigned replicas and a majority of those replicas for reads and writes. Keep the same bootstrap voters for an existing cluster. The peer protocol validates the bootstrap voters, and an upgrade from the original fixed three-member peer protocol requires restarting all nodes with the new image.
 
-Cluster consumers currently use manual partition assignment. The cluster supports up to 128 partitions and topics with unlimited retention. Cluster consumer group failover, log retention, snapshots, general-purpose replica rebalancing and conversion of single-node volumes remain in the release plan. Each node keeps its original volume, including its producer-ID counter and election state.
+Cluster consumers can assign partitions manually or subscribe with dynamic classic groups. Four internal Raft shards route group requests and persist commits to a voting majority. After coordinator failover, members rejoin and resume from committed offsets. Each shard supports up to 64 groups and 32 pending or active members, with the same default seven-day offset retention as single-node. To enable groups on an existing cluster, restart all brokers on the new image while keeping the original volumes and bootstrap configuration. See [distributed classic consumer groups](docs/cluster-groups.md).
 
-Run `tests/java/cluster-smoke.sh` to exercise leader termination, replica rejoin, network partition and loss of quorum. Run `tests/java/topology-smoke.sh` to check independent RF3 and RF5 quorums on five brokers. Both use Kafka Java Client 4.1.2.
+The cluster supports up to 128 user partitions. By default, records are retained indefinitely. Set `retention.ms` or `retention.bytes` at topic creation to advance the Kafka-visible start by whole segments. Time retention uses broker append time. Size retention keeps the active segment. Replicas retain the consensus log on disk, so `retention.bytes` currently limits the visible range only. Reclaiming disk space requires installable Raft snapshots and log compaction. Upgrade all brokers before enabling cluster retention because replication uses new append-time and retention records.
+
+Cluster Fetch supports full requests with a wait capped at two seconds before the final quorum read. It wakes on committed appends or leadership changes and preserves the first-batch exception to byte limits. Conversion of single-node volumes remains in the release plan.
+
+Run `tests/java/cluster-smoke.sh` to exercise leader termination, replica rejoin, network partition, loss of quorum, logical retention and Fetch long polling. Run `tests/java/topology-smoke.sh` to check independent RF3 and RF5 quorums on five brokers. Both use Kafka Java Client 4.1.2. Run `tests/java/cluster-groups-smoke.sh` for classic group protocol versions, Java and Spring consumer failover, coordinator network isolation and offset recovery after a full restart.
 
 ## Add a broker to a running cluster
 
@@ -72,7 +76,24 @@ Later, start the reserve broker in the same Compose project.
 docker compose --project-directory "$PWD" -f "$RUSTA_CLUSTER_PKI/compose.yaml" -p rusta-grow up -d --wait broker4
 ```
 
-The broker registers over mTLS and joins the controller log as a learner. After it catches up durably, the controller commits its promotion. The Kafka broker list and new topic placement use the committed membership. Existing partitions keep their replica sets. Keep the original bootstrap voter list and data volumes across restarts. Run `tests/java/membership-smoke.sh` to verify promotion while writes are active and membership recovery after restart.
+The broker registers over mTLS and joins the controller log as a learner. After it catches up durably, the controller commits its promotion. The Kafka broker list and new topic placement use the committed membership. Existing partitions keep their replica sets until an operator requests a rebalance. Keep the original bootstrap voter list and data volumes across restarts. Run `tests/java/membership-smoke.sh` to verify expansion, replica balancing, leadership transfer and recovery with concurrent Java traffic.
+
+## Rebalance replicas and transfer leadership
+
+Run the local commands inside the broker containers with the same Compose project used for expansion. `relocation-status` shows the broker's current controller view, the committed plan, progress and the last completed rebalance. Run `rebalance` on the active controller and `transfer-leadership` on the current partition leader.
+
+```sh
+docker compose --project-directory "$PWD" -f "$RUSTA_CLUSTER_PKI/compose.yaml" -p rusta-grow \
+  exec -T broker1 /usr/local/bin/rusta relocation-status
+docker compose --project-directory "$PWD" -f "$RUSTA_CLUSTER_PKI/compose.yaml" -p rusta-grow \
+  exec -T broker1 /usr/local/bin/rusta rebalance 6e0c4ca8-c1d9-4a76-9b45-a67badbd582d
+docker compose --project-directory "$PWD" -f "$RUSTA_CLUSTER_PKI/compose.yaml" -p rusta-grow \
+  exec -T broker2 /usr/local/bin/rusta transfer-leadership my-topic 0 4
+```
+
+Supply your own request UUID and reuse it if the result is uncertain. The controller recognizes the active plan and its last completed plan. It balances total replica counts across committed brokers, including internal group shards. Topic IDs, partition IDs and replication factors stay stable. Only one plan runs at a time, with one learner catching up at up to 8 MiB/s plus burst capacity. The committed plan resumes after controller restart and waits for an unavailable destination.
+
+Explicit transfer requires a caught-up voting replica. The command reports success after the requesting broker observes the requested leader. The local administration socket is available only to the broker account or an operator with access to its private data directory. Upgrade all brokers before invoking the new relocation commands.
 
 ## Remove a broker from a running cluster
 

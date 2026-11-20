@@ -91,6 +91,10 @@ impl Scan {
         })
     }
 
+    pub fn byte_position(&self) -> u64 {
+        self.cursor.byte
+    }
+
     pub fn next(&mut self, payload: &mut Vec<u8>) -> io::Result<Option<Entry>> {
         if self.cursor.byte == self.file_len {
             return Ok(None);

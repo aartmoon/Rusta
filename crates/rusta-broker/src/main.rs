@@ -78,6 +78,30 @@ async fn main() -> Result<()> {
         );
         return Ok(());
     }
+    let args: Vec<_> = std::env::args().skip(2).collect();
+    let admin = match (command.as_deref(), args.as_slice()) {
+        (Some("rebalance"), []) => Some(cluster::admin::Command::Rebalance {
+            id: uuid::Uuid::new_v4(),
+        }),
+        (Some("rebalance"), [id]) => Some(cluster::admin::Command::Rebalance { id: id.parse()? }),
+        (Some("relocation-status"), []) => Some(cluster::admin::Command::RelocationStatus),
+        (Some("transfer-leadership"), [topic, partition, to]) => {
+            Some(cluster::admin::Command::Transfer {
+                topic: topic.clone(),
+                partition: partition.parse()?,
+                to: to.parse()?,
+            })
+        }
+        (Some("rebalance" | "relocation-status" | "transfer-leadership"), _) => {
+            anyhow::bail!(
+                "usage: rebalance [request-uuid] | relocation-status | transfer-leadership <topic> <partition> <broker-id>"
+            );
+        }
+        _ => None,
+    };
+    if let Some(command) = admin {
+        return cluster::admin::run(&path, command).await;
+    }
     let host = Listener::from_env(
         "RUSTA_BIND",
         "RUSTA_ADVERTISED",
@@ -259,6 +283,7 @@ async fn connection(
     state: Arc<Server>,
 ) -> Result<()> {
     socket.set_nodelay(true)?;
+    let client_host = socket.peer_addr()?.ip().to_string();
     loop {
         let size = timeout(IDLE_TIMEOUT, socket.read_i32()).await??;
         ensure!(
@@ -270,9 +295,15 @@ async fn connection(
         timeout(IO_TIMEOUT, socket.read_exact(&mut frame)).await??;
         let (head, request) = decode(frame.into())?;
         if let Some(cluster) = &state.cluster {
-            if let Some(response) =
-                timeout(IO_TIMEOUT, cluster.request(&head, request, internal)).await??
-            {
+            let waits = matches!(request, Request::JoinGroup(_) | Request::SyncGroup(_));
+            let request = cluster.request(&head, request, internal, client_host.clone());
+            let response = if waits {
+                drop(request_slot.take());
+                request.await?
+            } else {
+                timeout(IO_TIMEOUT, request).await??
+            };
+            if let Some(response) = response {
                 timeout(IO_TIMEOUT, socket.write_all(&response)).await??;
             }
             continue;
@@ -280,7 +311,7 @@ async fn connection(
 
         let response = match request {
             Request::JoinGroup(request) => {
-                let host = socket.peer_addr()?.ip().to_string();
+                let host = client_host.clone();
                 let client = head.client_id.clone();
                 let completion = state
                     .work(move |catalog| Ok(catalog.groups.join(request, client, host)))

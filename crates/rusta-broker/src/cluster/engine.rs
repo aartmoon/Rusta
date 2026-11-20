@@ -9,26 +9,28 @@ use bytes::{BufMut, Bytes, BytesMut};
 use protobuf::Message as ProtoMessage;
 use raft::{
     Config, RawNode, StateRole, Storage,
-    eraftpb::{ConfChange, ConfChangeType, EntryType, Message},
+    eraftpb::{ConfChange, ConfChangeType, EntryType, Message, MessageType},
 };
 use rusta_kafka::records::Batch;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::{Notify, Semaphore, oneshot};
 use uuid::Uuid;
 
 use crate::{
     catalog::{MAX_PARTITIONS, TopicConfig},
+    groups::{self, Completion, Group, Groups},
     partition::{History, MAX_BATCH, MAX_PRODUCER_STATES},
     protocol::Error,
 };
 
 use super::{
     Settings,
-    disk::{Disk, decode_change, replace},
+    disk::{Disk, decode_change, encode_batch, encode_retention, replace},
     transport::{Packet, Queued, Senders},
 };
 
 type Reply<T> = oneshot::Receiver<Result<T, Error>>;
+type GroupOperation<T> = (T, Option<Reply<i64>>);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct GroupId {
@@ -41,10 +43,67 @@ pub const CONTROL: GroupId = GroupId {
     partition: 0,
 };
 
+const GROUP_SHARDS: usize = 4;
+
+fn group_shard(index: usize) -> GroupId {
+    GroupId {
+        topic: Uuid::nil(),
+        partition: index as u32 + 1,
+    }
+}
+
+pub fn coordinator(id: &str) -> GroupId {
+    let hash = id.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    });
+    group_shard((hash % GROUP_SHARDS as u64) as usize)
+}
+
+fn is_group_shard(key: GroupId) -> bool {
+    key.topic.is_nil() && (1..=GROUP_SHARDS as u32).contains(&key.partition)
+}
+
+#[derive(Deserialize, Serialize)]
+enum ShardRecord {
+    V1(Vec<groups::Event>),
+}
+
+struct GroupShard {
+    committed: HashMap<String, Group>,
+    active: Option<(u64, Groups)>,
+    completions: Vec<Completion>,
+}
+
 const MAX_CLUSTER_PARTITIONS: usize = 128;
 const MAX_READ_BARRIERS: usize = 16;
 
+const RELOCATION_RATE: u64 = 8 * 1024 * 1024;
+const RELOCATION_BURST: u64 = 3 * 1024 * 1024;
+
+struct RelocationBudget {
+    bytes: u64,
+    updated: Instant,
+}
+
+impl RelocationBudget {
+    fn admit(&mut self, bytes: u64) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.updated).as_micros();
+        let refill = (elapsed * u128::from(RELOCATION_RATE) / 1_000_000)
+            .min(u128::from(RELOCATION_BURST)) as u64;
+        self.bytes = self.bytes.saturating_add(refill).min(RELOCATION_BURST);
+        self.updated = now;
+        if self.bytes < bytes {
+            return false;
+        }
+        self.bytes -= bytes;
+        true
+    }
+}
+
 pub struct Engine {
+    pub data_available: Arc<Notify>,
+    pub group_progress: Arc<Notify>,
     pub settings: Settings,
     pub topics: BTreeMap<String, TopicConfig>,
     pub names: HashMap<Uuid, String>,
@@ -54,9 +113,11 @@ pub struct Engine {
     replicas: HashMap<GroupId, Vec<u64>>,
     origins: HashMap<GroupId, Vec<u64>>,
     retired: BTreeSet<u64>,
-    drain: Option<DrainPlan>,
+    relocation: Option<RelocationPlan>,
+    last_rebalance: Option<Uuid>,
     drain_requests: BTreeSet<u64>,
     move_ready: bool,
+    relocation_budget: RelocationBudget,
 
     leaders: HashMap<GroupId, (u64, i32, Instant)>,
     last_report: Instant,
@@ -65,6 +126,7 @@ pub struct Engine {
     next_producer: u64,
     reserved_producer: u64,
     data: PathBuf,
+    group_retention_ms: u64,
 }
 
 pub struct Node {
@@ -73,6 +135,8 @@ pub struct Node {
     reads: HashMap<Vec<u8>, Read>,
     histories: HashMap<i64, History>,
     committed_term: u64,
+    group: Option<GroupShard>,
+    fetch_leadership: (u64, u64),
 }
 
 struct Pending {
@@ -96,13 +160,15 @@ pub struct Movement {
 }
 
 #[derive(Deserialize, Serialize)]
-struct DrainPlan {
-    node: u64,
+struct RelocationPlan {
+    #[serde(default)]
+    id: Uuid,
+    node: Option<u64>,
     movements: Vec<Movement>,
     next: usize,
 }
 
-impl DrainPlan {
+impl RelocationPlan {
     fn active(&self) -> Option<Movement> {
         self.movements.get(self.next).copied()
     }
@@ -111,9 +177,12 @@ impl DrainPlan {
 #[derive(Deserialize, Serialize)]
 enum Event {
     Topic(TopicConfig),
-    Drain(DrainPlan),
+    Drain(RelocationPlan),
+    Rebalance(RelocationPlan),
+    Rebalanced(Uuid),
     Moved(Movement),
     Drained(u64),
+    GroupShards([Vec<u64>; GROUP_SHARDS]),
     PlacedTopic {
         config: TopicConfig,
         replicas: Vec<Vec<u64>>,
@@ -129,7 +198,7 @@ impl Engine {
             &settings,
             &data.join("control"),
             settings.bootstrap_voters.clone(),
-            true,
+            CONTROL,
         )?;
         let membership = &control.raw.store().membership;
         ensure!(
@@ -142,6 +211,8 @@ impl Engine {
         );
         let counter = read_counter(root)?;
         let mut engine = Self {
+            data_available: Arc::new(Notify::new()),
+            group_progress: Arc::new(Notify::new()),
             settings,
             topics: BTreeMap::new(),
             names: HashMap::new(),
@@ -151,9 +222,14 @@ impl Engine {
             replicas: HashMap::new(),
             origins: HashMap::new(),
             retired: BTreeSet::new(),
-            drain: None,
+            relocation: None,
+            last_rebalance: None,
             drain_requests: BTreeSet::new(),
             move_ready: false,
+            relocation_budget: RelocationBudget {
+                bytes: RELOCATION_BURST,
+                updated: Instant::now(),
+            },
 
             leaders: HashMap::new(),
             last_report: Instant::now(),
@@ -162,6 +238,7 @@ impl Engine {
             next_producer: counter + 1,
             reserved_producer: counter,
             data,
+            group_retention_ms: groups::retention_ms()?,
         };
         let log = &control.raw.store().log;
         let mut index = log.start().next_index;
@@ -210,20 +287,50 @@ impl Engine {
                 (config, placements)
             }
             Event::PlacedTopic { config, replicas } => (config, replicas),
+            Event::GroupShards(placements) => {
+                ensure!(
+                    self.replicas(group_shard(0)).is_empty(),
+                    "duplicate group shard placement"
+                );
+                for (index, voters) in placements.into_iter().enumerate() {
+                    self.register(group_shard(index), voters)?;
+                }
+                return Ok(());
+            }
             Event::Drain(plan) => {
                 ensure!(
-                    self.drain.is_none() && !self.retired.contains(&plan.node),
-                    "overlapping drain plans"
+                    plan.node.is_some_and(|id| !self.retired.contains(&id)),
+                    "invalid drain plan"
                 );
-                self.drain = Some(plan);
-                self.open_destination()?;
+                self.start_relocation(plan)?;
+                return Ok(());
+            }
+            Event::Rebalance(plan) => {
+                ensure!(
+                    !plan.id.is_nil() && plan.node.is_none(),
+                    "invalid rebalance plan"
+                );
+                self.start_relocation(plan)?;
+                return Ok(());
+            }
+            Event::Rebalanced(id) => {
+                ensure!(
+                    self.relocation
+                        .as_ref()
+                        .is_some_and(|plan| plan.node.is_none()
+                            && plan.id == id
+                            && plan.active().is_none()),
+                    "unexpected rebalance completion"
+                );
+                self.last_rebalance = Some(id);
+                self.relocation = None;
                 return Ok(());
             }
             Event::Moved(movement) => {
                 let plan = self
-                    .drain
+                    .relocation
                     .as_mut()
-                    .context("placement update without a drain")?;
+                    .context("placement update without a relocation plan")?;
                 ensure!(plan.active() == Some(movement), "unexpected completed move");
                 let replicas = self
                     .replicas
@@ -251,13 +358,13 @@ impl Engine {
             }
             Event::Drained(id) => {
                 ensure!(
-                    self.drain
+                    self.relocation
                         .as_ref()
-                        .is_some_and(|p| p.node == id && p.active().is_none()),
+                        .is_some_and(|p| p.node == Some(id) && p.active().is_none()),
                     "unexpected drain completion"
                 );
                 self.retired.insert(id);
-                self.drain = None;
+                self.relocation = None;
                 self.drain_requests.remove(&id);
                 self.join_requests.remove(&id);
                 return Ok(());
@@ -276,34 +383,68 @@ impl Engine {
             "invalid partition assignment count"
         );
         for (partition, voters) in placements.into_iter().enumerate() {
-            let unique: std::collections::HashSet<_> = voters.iter().collect();
-            ensure!(
-                !voters.is_empty()
-                    && unique.len() == voters.len()
-                    && voters.iter().all(|id| self.settings.peers.contains_key(id)),
-                "invalid replica assignment"
-            );
-            let group = GroupId {
+            let key = GroupId {
                 topic: config.id,
                 partition: partition as u32,
             };
-            if voters.contains(&self.settings.id) {
-                let path = self.data.join(format!("{}-{partition}", config.id));
-                self.nodes.insert(
-                    group,
-                    Node::open(&self.settings, &path, voters.clone(), false)?,
-                );
-            }
-            self.origins.insert(group, voters.clone());
-            self.replicas.insert(group, voters);
+            self.register(key, voters)?;
         }
         self.names.insert(config.id, config.name.clone());
         self.topics.insert(config.name.clone(), config);
         Ok(())
     }
 
+    fn register(&mut self, key: GroupId, voters: Vec<u64>) -> Result<()> {
+        let unique: BTreeSet<_> = voters.iter().collect();
+        ensure!(
+            !self.replicas.contains_key(&key)
+                && !voters.is_empty()
+                && unique.len() == voters.len()
+                && voters.iter().all(|id| self.settings.peers.contains_key(id)),
+            "invalid replica assignment"
+        );
+        if voters.contains(&self.settings.id) {
+            let path = self.data.join(format!("{}-{}", key.topic, key.partition));
+            self.nodes
+                .insert(key, Node::open(&self.settings, &path, voters.clone(), key)?);
+        }
+        self.origins.insert(key, voters.clone());
+        self.replicas.insert(key, voters);
+        Ok(())
+    }
+
+    fn bootstrap_groups(&mut self) -> Result<()> {
+        if !self.replicas(group_shard(0)).is_empty() || self.relocation.is_some() {
+            return Ok(());
+        }
+        let mut voters = self.voters().to_vec();
+        voters.sort_unstable();
+        let node = self.nodes.get_mut(&CONTROL).expect("control group");
+        if !node.admitting() || voters.is_empty() {
+            return Ok(());
+        }
+        let factor = voters.len().min(3);
+        let placements = std::array::from_fn(|shard| {
+            (0..factor)
+                .map(|replica| voters[(shard + replica) % voters.len()])
+                .collect()
+        });
+        node.propose(serde_json::to_vec(&Event::GroupShards(placements))?, 0)?;
+        self.drain(CONTROL)
+    }
+
+    fn start_relocation(&mut self, plan: RelocationPlan) -> Result<()> {
+        ensure!(
+            self.relocation.is_none() && plan.next == 0,
+            "overlapping relocation plans"
+        );
+        self.relocation = Some(plan);
+        self.move_ready = false;
+        self.open_destination()
+    }
+
     fn open_destination(&mut self) -> Result<()> {
-        let Some(movement) = self.drain.as_ref().and_then(DrainPlan::active) else {
+        let Some(movement) = self.relocation.as_ref().and_then(RelocationPlan::active) else {
             return Ok(());
         };
         if self.settings.id == movement.to && !self.nodes.contains_key(&movement.key) {
@@ -315,7 +456,7 @@ impl Engine {
                 .context("missing partition bootstrap voters")?;
             self.nodes.insert(
                 key,
-                Node::open(&self.settings, &path, origins.clone(), false)?,
+                Node::open(&self.settings, &path, origins.clone(), key)?,
             );
         }
         Ok(())
@@ -324,7 +465,11 @@ impl Engine {
     pub fn placement_count(&self) -> usize {
         self.voters()
             .iter()
-            .filter(|id| self.drain.as_ref().is_none_or(|plan| plan.node != **id))
+            .filter(|id| {
+                self.relocation
+                    .as_ref()
+                    .is_none_or(|plan| plan.node != Some(**id))
+            })
             .count()
     }
 
@@ -335,8 +480,11 @@ impl Engine {
         Ok(())
     }
 
-    pub fn receive_move(&mut self, reporter: u64, movement: Movement) -> Result<()> {
-        if self.drain.as_ref().and_then(DrainPlan::active) == Some(movement)
+    pub fn receive_move(&mut self, reporter: u64, plan_id: Uuid, movement: Movement) -> Result<()> {
+        if self
+            .relocation
+            .as_ref()
+            .is_some_and(|plan| plan.id == plan_id && plan.active() == Some(movement))
             && reporter != movement.from
             && (reporter == movement.to || self.replicas(movement.key).contains(&reporter))
         {
@@ -345,7 +493,7 @@ impl Engine {
         Ok(())
     }
 
-    fn plan_drain(&self, from: u64) -> Option<DrainPlan> {
+    fn plan_drain(&self, from: u64) -> Option<RelocationPlan> {
         let mut available: Vec<_> = self
             .voters()
             .iter()
@@ -369,11 +517,150 @@ impl Engine {
                 available.rotate_left(1);
             }
         }
-        Some(DrainPlan {
-            node: from,
+        Some(RelocationPlan {
+            id: Uuid::new_v4(),
+            node: Some(from),
             movements,
             next: 0,
         })
+    }
+
+    pub fn rebalance(&mut self, id: Uuid) -> Result<Result<RebalanceResult, String>> {
+        let control = &self.nodes[&CONTROL];
+        if !control.local_leader() {
+            return Ok(Err(format!(
+                "send rebalance to controller {}",
+                control.leader()
+            )));
+        }
+        if id.is_nil() {
+            return Ok(Err("rebalance requires a nonzero request ID".into()));
+        }
+        if self.last_rebalance == Some(id) {
+            return Ok(Ok(RebalanceResult::Completed));
+        }
+        if self.relocation.as_ref().is_some_and(|plan| plan.id == id) {
+            return Ok(Ok(RebalanceResult::Active));
+        }
+        if self.relocation.is_some() || !self.drain_requests.is_empty() {
+            return Ok(Err("another relocation is in progress or queued".into()));
+        }
+        if !control.admitting() {
+            return Ok(Err("controller is busy, retry the same request ID".into()));
+        }
+        let movements = balance_movements(self.voters(), &self.replicas);
+        if movements.is_empty() {
+            return Ok(Ok(RebalanceResult::Balanced));
+        }
+        let record = Event::Rebalance(RelocationPlan {
+            id,
+            node: None,
+            movements,
+            next: 0,
+        });
+        let encoded = serde_json::to_vec(&record)?;
+        if encoded.len() > MAX_BATCH {
+            return Ok(Err(
+                "the rebalance plan exceeds the controller entry limit".into()
+            ));
+        }
+        let reply = self
+            .nodes
+            .get_mut(&CONTROL)
+            .expect("controller group")
+            .propose(encoded, 0)?;
+        self.drain(CONTROL)?;
+        Ok(Ok(RebalanceResult::Pending(reply)))
+    }
+
+    pub fn relocation_status(&self) -> serde_json::Value {
+        let active = self.relocation.as_ref().map(|plan| {
+            let movement = plan.active().map(|movement| {
+                let (leader, _) = self.leader_view(movement.key);
+                let node = self.nodes.get(&movement.key);
+                let phase = if self.move_ready {
+                    "committing_placement"
+                } else if let Some(node) = node {
+                    let members = &node.raw.store().membership;
+                    if !members.voters.contains(&movement.from)
+                        && members.voters.contains(&movement.to)
+                    {
+                        "committing_placement"
+                    } else if members.voters.contains(&movement.to) {
+                        "removing_source"
+                    } else if members.learners.contains(&movement.to) {
+                        "catching_up"
+                    } else {
+                        "adding_learner"
+                    }
+                } else {
+                    "awaiting_replica_report"
+                };
+                serde_json::json!({
+                    "topic": self.names.get(&movement.key.topic),
+                    "topic_id": movement.key.topic,
+                    "partition": movement.key.partition,
+                    "from": movement.from,
+                    "to": movement.to,
+                    "leader": leader,
+                    "partition_kind": if is_group_shard(movement.key) { "group_shard" } else { "topic" },
+                    "phase": phase
+                })
+            });
+            serde_json::json!({
+                "id": plan.id,
+                "kind": if plan.node.is_some() { "decommission" } else { "rebalance" },
+                "retiring_broker": plan.node,
+                "completed": plan.next,
+                "total": plan.movements.len(),
+                "movement": movement
+            })
+        });
+        serde_json::json!({
+            "broker": self.settings.id,
+            "controller": self.nodes[&CONTROL].leader(),
+            "active": active,
+            "last_rebalance": self.last_rebalance,
+        })
+    }
+
+    pub fn transfer_leadership(
+        &mut self,
+        topic: &str,
+        partition: i32,
+        target: u64,
+    ) -> Result<Result<GroupId, String>> {
+        let Ok(key) = self.topic_key(topic, partition) else {
+            return Ok(Err("unknown topic or partition".into()));
+        };
+        let local = self.settings.id;
+        let (leader, _) = self.leader_view(key);
+        if leader != local {
+            return Ok(Err(format!("send transfer to partition leader {leader}")));
+        }
+        if self
+            .relocation
+            .as_ref()
+            .and_then(RelocationPlan::active)
+            .is_some_and(|move_| move_.key == key)
+        {
+            return Ok(Err("partition is relocating".into()));
+        }
+        let node = self.nodes.get_mut(&key).expect("local partition leader");
+        if target == local {
+            return Ok(Ok(key));
+        }
+        if !node.raw.store().membership.voters.contains(&target) {
+            return Ok(Err("target is not a voting replica".into()));
+        }
+        if !node.admitting() || !node.caught_up(target) {
+            return Ok(Err(
+                "target or leader is not ready, retry the transfer".into()
+            ));
+        }
+        node.raw.transfer_leader(target);
+        self.drain(key)?;
+        Ok(Ok(key))
     }
 
     fn propose_control(&mut self, event: Event) -> Result<()> {
@@ -382,8 +669,8 @@ impl Engine {
         self.drain(CONTROL)
     }
 
-    fn drive_drain(&mut self) -> Result<()> {
-        let active = self.drain.as_ref().and_then(DrainPlan::active);
+    fn drive_relocation(&mut self) -> Result<()> {
+        let active = self.relocation.as_ref().and_then(RelocationPlan::active);
         if let Some(movement) = active {
             self.drive_partition_move(movement)?;
         }
@@ -391,15 +678,19 @@ impl Engine {
         if !control.admitting() {
             return Ok(());
         }
-        if let Some(plan) = &self.drain {
+        if let Some(plan) = &self.relocation {
             if let Some(movement) = active {
                 if self.move_ready {
                     self.propose_control(Event::Moved(movement))?;
                 }
-            } else if !self.voters().contains(&plan.node) {
-                self.propose_control(Event::Drained(plan.node))?;
+            } else if let Some(from) = plan.node {
+                if self.voters().contains(&from) {
+                    self.finish_removal(CONTROL, from)?;
+                } else {
+                    self.propose_control(Event::Drained(from))?;
+                }
             } else {
-                self.finish_removal(CONTROL, plan.node)?;
+                self.propose_control(Event::Rebalanced(plan.id))?;
             }
         } else if let Some(plan) = self
             .drain_requests
@@ -420,9 +711,10 @@ impl Engine {
         }
         let membership = &node.raw.store().membership;
         if !membership.voters.contains(&movement.from) && membership.voters.contains(&movement.to) {
-            self.receive_move(self.settings.id, movement)?;
+            let id = self.relocation.as_ref().expect("active relocation").id;
+            self.receive_move(self.settings.id, id, movement)?;
             for queue in self.outbound.values() {
-                Queued::send(queue, &self.send_bytes, Packet::Moved(movement));
+                Queued::send(queue, &self.send_bytes, Packet::Moved(id, movement));
             }
         } else if !node.admitting() {
             return Ok(());
@@ -526,7 +818,11 @@ impl Engine {
             .voters()
             .iter()
             .copied()
-            .filter(|id| self.drain.as_ref().is_none_or(|plan| plan.node != *id))
+            .filter(|id| {
+                self.relocation
+                    .as_ref()
+                    .is_none_or(|plan| plan.node != Some(*id))
+            })
             .collect();
         voters.sort_unstable();
         if !(1..=voters.len()).contains(&factor) {
@@ -563,7 +859,7 @@ impl Engine {
 
     pub fn produce(&mut self, key: GroupId, records: Bytes) -> Result<Result<Write, Error>> {
         // Give a ready membership change the admission slot between batches.
-        if let Some(movement) = self.drain.as_ref().and_then(DrainPlan::active)
+        if let Some(movement) = self.relocation.as_ref().and_then(RelocationPlan::active)
             && movement.key == key
             && self
                 .nodes
@@ -628,7 +924,13 @@ impl Engine {
         bytes.extend_from_slice(&records[8..12]);
         bytes.put_i32(epoch);
         bytes.extend_from_slice(&records[16..]);
-        let reply = node.propose(bytes.to_vec(), offset)?;
+        let timestamp = self
+            .names
+            .get(&key.topic)
+            .and_then(|name| self.topics.get(name))
+            .filter(|topic| topic.retention_ms.is_some_and(|limit| limit >= 0))
+            .map_or(0, |_| groups::now_ms().max(1) as i64);
+        let reply = node.propose(encode_batch(timestamp, &bytes), offset)?;
         self.drain(key)?;
         Ok(Ok(Write::Pending(reply)))
     }
@@ -662,6 +964,95 @@ impl Engine {
         Ok(Ok(receiver))
     }
 
+    pub fn local_group_shards(&self) -> BTreeSet<GroupId> {
+        self.nodes
+            .iter()
+            .filter(|(_, node)| node.group.is_some() && node.local_leader())
+            .map(|(key, _)| *key)
+            .collect()
+    }
+
+    pub fn group_barrier(&mut self, key: GroupId) -> Result<Result<(u64, Reply<()>), Error>> {
+        let Some(node) = self.nodes.get(&key) else {
+            return Ok(Err(self.coordinator_error(key)));
+        };
+        if !node.local_leader() {
+            return Ok(Err(self.coordinator_error(key)));
+        }
+        let term = node.raw.raft.term;
+        Ok(self
+            .read(key)?
+            .map(|reply| (term, reply))
+            .map_err(group_error))
+    }
+
+    fn coordinator_error(&self, key: GroupId) -> Error {
+        if self.leader_view(key).0 == 0 {
+            Error::CoordinatorNotAvailable
+        } else {
+            Error::NotCoordinator
+        }
+    }
+
+    pub fn group_entries(&self, key: GroupId, term: u64) -> Result<&HashMap<String, Group>, Error> {
+        let node = self
+            .nodes
+            .get(&key)
+            .ok_or_else(|| self.coordinator_error(key))?;
+        let shard = node.group.as_ref().expect("group shard");
+        if node.local_leader() && node.raw.raft.term == term {
+            return Ok(&shard.committed);
+        }
+        Err(Error::NotCoordinator)
+    }
+
+    pub fn active_groups(&self, key: GroupId, term: u64) -> Result<&Groups, Error> {
+        self.group_entries(key, term)?;
+        let node = &self.nodes[&key];
+        if !node.admitting() {
+            return Err(Error::CoordinatorLoadInProgress);
+        }
+        Ok(&node
+            .group
+            .as_ref()
+            .expect("group shard")
+            .active
+            .as_ref()
+            .ok_or(Error::CoordinatorLoadInProgress)?
+            .1)
+    }
+
+    pub fn with_group<T>(
+        &mut self,
+        key: GroupId,
+        term: u64,
+        work: impl FnOnce(&mut Groups, &BTreeMap<String, TopicConfig>) -> T,
+    ) -> Result<Result<GroupOperation<T>, Error>> {
+        if let Err(error) = self.active_groups(key, term) {
+            return Ok(Err(error));
+        }
+        let node = self.nodes.get_mut(&key).expect("active group shard");
+        let shard = node.group.as_mut().expect("group shard");
+        let groups = &mut shard.active.as_mut().expect("active group state").1;
+        let value = work(groups, &self.topics);
+        let (events, completions) = groups.take_events();
+        let reply = if events.is_empty() {
+            ensure!(completions.is_empty(), "group completion without a record");
+            None
+        } else {
+            shard.completions = completions;
+            let bytes = serde_json::to_vec(&ShardRecord::V1(events))?;
+            ensure!(
+                bytes.len() <= MAX_BATCH,
+                "group record exceeds Raft entry limit"
+            );
+            let pending = node.propose(bytes, 0)?;
+            self.drain(key)?;
+            Some(pending)
+        };
+        Ok(Ok((value, reply)))
+    }
+
     pub fn allocate_producer(&mut self) -> Result<i64> {
         if self.next_producer > self.reserved_producer {
             let next = self
@@ -690,7 +1081,10 @@ impl Engine {
         if self.settings.peers.contains_key(&source)
             && !self.voters().contains(&source)
             && !self.retired.contains(&source)
-            && self.drain.as_ref().is_none_or(|plan| plan.node != source)
+            && self
+                .relocation
+                .as_ref()
+                .is_none_or(|plan| plan.node != Some(source))
         {
             self.join_requests.insert(source, Instant::now());
         }
@@ -701,7 +1095,10 @@ impl Engine {
         self.join_requests.retain(|id, since| {
             since.elapsed() < Duration::from_secs(2)
                 && !self.retired.contains(id)
-                && self.drain.as_ref().is_none_or(|plan| plan.node != *id)
+                && self
+                    .relocation
+                    .as_ref()
+                    .is_none_or(|plan| plan.node != Some(*id))
         });
         let node = self.nodes.get_mut(&CONTROL).expect("control group");
         if !node.admitting() {
@@ -745,6 +1142,10 @@ impl Engine {
             if let Some(node) = self.nodes.get_mut(&key) {
                 node.raw.tick();
                 self.drain(key)?;
+                if is_group_shard(key) {
+                    let term = self.nodes[&key].raw.raft.term;
+                    let _ = self.with_group(key, term, |groups, _| groups.maintain(true))?;
+                }
             }
         }
         if self.last_report.elapsed() >= Duration::from_millis(250) {
@@ -767,8 +1168,10 @@ impl Engine {
                     Queued::send(queue, &self.send_bytes, Packet::Join);
                 }
             }
-            self.drive_drain()?;
-            if self.drain.is_none() {
+            self.bootstrap_groups()?;
+            self.drive_relocation()?;
+            self.advance_retention()?;
+            if self.relocation.is_none() {
                 self.advance_membership()?;
             }
             let mut report = BytesMut::new();
@@ -793,6 +1196,49 @@ impl Engine {
         Ok(())
     }
 
+    fn advance_retention(&mut self) -> Result<()> {
+        let time = groups::now_ms() as i64;
+        let mut proposals = Vec::new();
+        for (&key, node) in &self.nodes {
+            if !node.admitting() {
+                continue;
+            }
+            let Some(config) = self
+                .names
+                .get(&key.topic)
+                .and_then(|name| self.topics.get(name))
+            else {
+                continue;
+            };
+            let keep_ms = config.retention_ms.filter(|&limit| limit >= 0);
+            let max_bytes = config
+                .retention_bytes
+                .and_then(|limit| u64::try_from(limit).ok());
+            if keep_ms.is_none() && max_bytes.is_none() {
+                continue;
+            }
+            let current = node.raw.store().retained;
+            let next = node.log().retention_boundary(
+                current,
+                rusta_log::Retention {
+                    keep_since_ms: keep_ms.map(|limit| time.saturating_sub(limit)),
+                    max_bytes,
+                },
+            )?;
+            if next.next_offset > current.next_offset {
+                proposals.push((key, next));
+            }
+        }
+        for (key, start) in proposals {
+            self.nodes
+                .get_mut(&key)
+                .expect("retained partition")
+                .propose(encode_retention(start), start.next_offset)?;
+            self.drain(key)?;
+        }
+        Ok(())
+    }
+
     pub fn receive(&mut self, key: GroupId, message: Message) -> Result<()> {
         if self.retired.contains(&message.from) {
             return Ok(());
@@ -806,9 +1252,17 @@ impl Engine {
     }
 
     fn drain(&mut self, key: GroupId) -> Result<()> {
+        let destination = self
+            .relocation
+            .as_ref()
+            .and_then(RelocationPlan::active)
+            .filter(|movement| movement.key == key)
+            .map(|movement| movement.to);
         let node = self.nodes.get_mut(&key).expect("existing group");
+        let previous_commit = node.log().committed();
         let mut events = Vec::new();
         let mut completions = Vec::new();
+        let mut completed_term = None;
         while node.raw.has_ready() {
             let mut ready = node.raw.ready();
             ensure!(ready.snapshot().is_empty(), "unexpected Raft snapshot");
@@ -838,8 +1292,12 @@ impl Engine {
                 } else if !entry.data.is_empty() {
                     if key == CONTROL {
                         events.push(serde_json::from_slice(&entry.data)?);
-                    } else {
-                        node.note_batch(&entry.data)?;
+                    } else if let Some(shard) = &mut node.group {
+                        apply_shard_record(&mut shard.committed, &entry.data)?;
+                    } else if let Some(batch) =
+                        node.raw.mut_store().apply_data(entry.index, &entry.data)?
+                    {
+                        node.note_batch(batch)?;
                     }
                 }
                 if node
@@ -848,6 +1306,7 @@ impl Engine {
                     .is_some_and(|p| p.term == entry.term && p.index == entry.index)
                 {
                     let pending = node.pending.take().expect("matching pending entry");
+                    completed_term = Some(pending.term);
                     completions.push(pending);
                 }
                 node.raw.advance_apply_to(entry.index);
@@ -858,6 +1317,16 @@ impl Engine {
                 }
             }
             for message in messages.chain(light.take_messages()) {
+                if destination == Some(message.to)
+                    && node.raw.store().membership.learners.contains(&message.to)
+                    && message.get_msg_type() == MessageType::MsgAppend
+                    && !message.entries.is_empty()
+                    && !self
+                        .relocation_budget
+                        .admit(u64::from(message.compute_size()))
+                {
+                    continue; // Raft retransmits append entries after the next heartbeat.
+                }
                 if let Some(queue) = self.outbound.get(&message.to) {
                     Queued::send(queue, &self.send_bytes, Packet::Raft(key, message));
                 }
@@ -872,6 +1341,32 @@ impl Engine {
         {
             let pending = node.pending.take().expect("old pending entry");
             let _ = pending.reply.send(Err(Error::NotLeader));
+        }
+        if let Some(shard) = &mut node.group {
+            let previous_term = shard.active.as_ref().map(|(term, _)| *term);
+            let active = local_leader && node.committed_term == term;
+            if completed_term.is_some() || !active {
+                for complete in shard.completions.drain(..) {
+                    complete(completed_term == Some(term) && active);
+                }
+            }
+            if !active {
+                shard.active = None;
+            } else if shard
+                .active
+                .as_ref()
+                .is_none_or(|(epoch, _)| *epoch != term)
+            {
+                shard.active = Some((
+                    term,
+                    Groups::replicated(GROUP_SHARDS, self.group_retention_ms, &shard.committed),
+                ));
+            }
+            if previous_term != shard.active.as_ref().map(|(term, _)| *term)
+                || node.log().committed() != previous_commit
+            {
+                self.group_progress.notify_waiters();
+            }
         }
         let next = node.raw.store().log.committed().next_index;
         node.reads.retain(|_, read| {
@@ -893,14 +1388,92 @@ impl Engine {
             }
             true
         });
+        if key != CONTROL && node.group.is_none() {
+            let leadership = (node.leader(), term);
+            if (local_leader && node.log().committed() != previous_commit)
+                || leadership != node.fetch_leadership
+            {
+                self.data_available.notify_waiters();
+            }
+            node.fetch_leadership = leadership;
+        }
         for event in events {
             self.apply(event)?;
         }
         for pending in completions {
-            let _ = pending.reply.send(Ok(pending.offset));
+            let result = if is_group_shard(key) && (!local_leader || pending.term != term) {
+                Err(Error::NotCoordinator)
+            } else {
+                Ok(pending.offset)
+            };
+            let _ = pending.reply.send(result);
         }
         Ok(())
     }
+}
+
+fn balance_movements(voters: &[u64], replicas: &HashMap<GroupId, Vec<u64>>) -> Vec<Movement> {
+    let mut assignment = replicas
+        .iter()
+        .map(|(&key, replicas)| (key, replicas.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut loads = voters
+        .iter()
+        .map(|&id| (id, 0_usize))
+        .collect::<BTreeMap<_, _>>();
+    for replicas in assignment.values() {
+        for id in replicas {
+            if let Some(load) = loads.get_mut(id) {
+                *load += 1;
+            }
+        }
+    }
+    let mut movements = Vec::new();
+    while let (Some((&from, &highest)), Some((&to, &lowest))) = (
+        loads
+            .iter()
+            .max_by_key(|&(&id, &load)| (load, std::cmp::Reverse(id))),
+        loads.iter().min_by_key(|&(&id, &load)| (load, id)),
+    ) {
+        if highest <= lowest + 1 {
+            break;
+        }
+        let (&key, replicas) = assignment
+            .iter_mut()
+            .find(|(_, replicas)| replicas.contains(&from) && !replicas.contains(&to))
+            .expect("higher replica count implies an eligible partition");
+        *replicas
+            .iter_mut()
+            .find(|replica| **replica == from)
+            .expect("existing source") = to;
+        *loads.get_mut(&from).expect("member load") -= 1;
+        *loads.get_mut(&to).expect("member load") += 1;
+        movements.push(Movement { key, from, to });
+    }
+    movements
+}
+
+fn apply_shard_record(groups: &mut HashMap<String, Group>, bytes: &[u8]) -> Result<()> {
+    let ShardRecord::V1(events) = serde_json::from_slice(bytes)?;
+    for event in events {
+        groups::apply_event(groups, event)?;
+    }
+    Ok(())
+}
+
+pub fn group_error(error: Error) -> Error {
+    match error {
+        Error::NotLeader => Error::NotCoordinator,
+        Error::RequestTimedOut => Error::CoordinatorLoadInProgress,
+        error => error,
+    }
+}
+
+pub enum RebalanceResult {
+    Pending(Reply<i64>),
+    Active,
+    Completed,
+    Balanced,
 }
 
 pub enum Write {
@@ -909,25 +1482,53 @@ pub enum Write {
 }
 
 impl Node {
-    fn open(settings: &Settings, path: &Path, voters: Vec<u64>, control: bool) -> Result<Self> {
+    fn open(settings: &Settings, path: &Path, voters: Vec<u64>, key: GroupId) -> Result<Self> {
         let mut histories = HashMap::<i64, History>::new();
-        let disk = Disk::open(path, voters, control, |entry, payload| {
-            let batch = Batch::parse(payload).map_err(std::io::Error::other)?;
-            if batch.producer > 0 {
-                if !histories.contains_key(&batch.producer)
-                    && histories.len() >= MAX_PRODUCER_STATES
-                {
-                    return Err(std::io::Error::other(
-                        "partition producer state exceeds limit",
-                    ));
+        let disk = Disk::open(
+            path,
+            voters,
+            key == CONTROL || is_group_shard(key),
+            |entry, payload| {
+                let batch = Batch::parse(payload).map_err(std::io::Error::other)?;
+                if batch.producer > 0 {
+                    if !histories.contains_key(&batch.producer)
+                        && histories.len() >= MAX_PRODUCER_STATES
+                    {
+                        return Err(std::io::Error::other(
+                            "partition producer state exceeds limit",
+                        ));
+                    }
+                    histories
+                        .entry(batch.producer)
+                        .or_default()
+                        .add(batch, entry.position.next_offset);
                 }
-                histories
-                    .entry(batch.producer)
-                    .or_default()
-                    .add(batch, entry.position.next_offset);
+                Ok(())
+            },
+        )?;
+        let group = if is_group_shard(key) {
+            let mut committed = HashMap::new();
+            let mut next = disk.log.start().next_index;
+            let end = disk.log.committed().next_index;
+            while next < end {
+                next = disk
+                    .log
+                    .visit_entries(next, end, MAX_BATCH as u64, |_, bytes| {
+                        if !bytes.is_empty() && bytes[0] != 255 {
+                            apply_shard_record(&mut committed, bytes)
+                                .map_err(std::io::Error::other)?;
+                        }
+                        Ok(())
+                    })?;
             }
-            Ok(())
-        })?;
+            Some(GroupShard {
+                committed,
+                active: None,
+                completions: Vec::new(),
+            })
+        } else {
+            None
+        };
         let end = disk.log.committed().next_index;
         let committed_term = disk.log.term(end - 1)?;
         let config = Config {
@@ -955,6 +1556,8 @@ impl Node {
             reads: HashMap::new(),
             histories,
             committed_term,
+            group,
+            fetch_leadership: (0, 0),
         })
     }
 
@@ -972,6 +1575,10 @@ impl Node {
 
     pub fn log(&self) -> &rusta_log::PartitionLog {
         &self.raw.store().log
+    }
+
+    pub fn log_start(&self) -> i64 {
+        self.raw.store().retained.next_offset
     }
 
     pub fn in_sync(&self) -> Vec<u64> {
@@ -1058,5 +1665,265 @@ fn read_counter(root: &Path) -> Result<u64> {
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
         Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        cluster::transport,
+        groups::{Key, Offset},
+    };
+    use tokio::sync::oneshot::error::TryRecvError;
+
+    const GROUP: &str = "fault-test";
+
+    type Outbound = HashMap<u64, tokio::sync::mpsc::Receiver<Queued>>;
+
+    struct TestCluster {
+        brokers: Vec<Option<Engine>>,
+        routes: Vec<Outbound>,
+        _root: tempfile::TempDir,
+    }
+
+    impl TestCluster {
+        fn open() -> Result<Self> {
+            let root = tempfile::tempdir()?;
+            let cluster = Uuid::new_v4();
+            let peers = (1..=3)
+                .map(|id| {
+                    let endpoint = super::super::endpoint("localhost:9092").unwrap();
+                    (
+                        id,
+                        super::super::Peer {
+                            raft: String::new(),
+                            dns: String::new(),
+                            host: endpoint.clone(),
+                            internal: endpoint,
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let mut brokers = Vec::new();
+            let mut routes = Vec::new();
+            for id in 1..=3 {
+                let settings = Settings {
+                    id,
+                    cluster,
+                    peers: peers.clone(),
+                    bootstrap_voters: vec![1, 2, 3],
+                    bind: "127.0.0.1:0".parse()?,
+                    certificates: PathBuf::new(),
+                };
+                let (senders, receivers) = transport::routes(&settings);
+                brokers.push(Some(Engine::open(
+                    settings,
+                    &root.path().join(id.to_string()),
+                    senders,
+                )?));
+                routes.push(receivers);
+            }
+            Ok(Self {
+                _root: root,
+                brokers,
+                routes,
+            })
+        }
+
+        fn pump(&mut self) -> Result<()> {
+            self.pump_until(|_| false)
+        }
+
+        fn pump_until(&mut self, stop: impl Fn(&Self) -> bool) -> Result<()> {
+            while !stop(self) {
+                let mut packets = Vec::new();
+                for (source, routes) in self.routes.iter_mut().enumerate() {
+                    for (&dest, receiver) in routes {
+                        while let Ok(queued) = receiver.try_recv() {
+                            if self.brokers[source].is_some()
+                                && let Packet::Raft(key, message) = queued.into_packet()
+                            {
+                                packets.push((dest as usize - 1, key, message));
+                            }
+                        }
+                    }
+                }
+                if packets.is_empty() {
+                    return Ok(());
+                }
+                for (dest, key, message) in packets {
+                    if let Some(broker) = &mut self.brokers[dest] {
+                        broker.receive(key, message)?;
+                    }
+                    if stop(self) {
+                        return Ok(());
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn leader(&mut self) -> Result<usize> {
+            for _ in 0..150 {
+                for broker in self.brokers.iter_mut().flatten() {
+                    broker.tick()?;
+                    broker.bootstrap_groups()?;
+                }
+                self.pump()?;
+                if let Some(index) = self.brokers.iter().position(|broker| {
+                    broker
+                        .as_ref()
+                        .and_then(|broker| broker.nodes.get(&coordinator(GROUP)))
+                        .is_some_and(Node::admitting)
+                }) {
+                    return Ok(index);
+                }
+            }
+            anyhow::bail!("no elected coordinator");
+        }
+
+        fn write(&mut self, leader: usize, partition: Key, value: i64) -> Result<Reply<i64>> {
+            let broker = self.brokers[leader].as_mut().unwrap();
+            let key = coordinator(GROUP);
+            let term = broker.nodes[&key].raw.raft.term;
+            let operation = broker.with_group(key, term, |groups, _| {
+                groups.commit(
+                    GROUP,
+                    vec![(
+                        partition,
+                        Offset {
+                            value,
+                            leader_epoch: -1,
+                            metadata: None,
+                        },
+                    )],
+                )
+            })?;
+            let (outcome, pending) = operation.expect("coordinator admitted commit");
+            outcome.expect("offset validated");
+            Ok(pending.expect("commit was proposed"))
+        }
+
+        fn read(&mut self, leader: usize, partition: Key) -> Result<i64> {
+            let key = coordinator(GROUP);
+            let (term, mut barrier) = self.brokers[leader]
+                .as_mut()
+                .unwrap()
+                .group_barrier(key)?
+                .expect("leader read barrier");
+            self.pump()?;
+            barrier.try_recv()?.expect("quorum authorized the read");
+            let groups = self.brokers[leader]
+                .as_ref()
+                .unwrap()
+                .group_entries(key, term)
+                .expect("coordinator term is current");
+            Ok(groups[GROUP].offsets[&partition].value)
+        }
+    }
+
+    #[test]
+    fn old_controller_drain_records_remain_readable() -> Result<()> {
+        let record =
+            serde_json::from_str::<Event>(r#"{"Drain":{"node":2,"movements":[],"next":0}}"#)?;
+        let Event::Drain(plan) = record else {
+            anyhow::bail!("expected a drain plan");
+        };
+        assert_eq!(plan.node, Some(2));
+        assert!(plan.id.is_nil());
+        assert!(plan.active().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn replica_balancing_preserves_rf_and_converges() {
+        let topic = Uuid::new_v4();
+        let mut replicas = (0..8)
+            .map(|partition| (GroupId { topic, partition }, vec![1, 2, 3]))
+            .collect::<HashMap<_, _>>();
+        replicas.insert(group_shard(0), vec![1, 2, 3]);
+        let roster = [1, 2, 3, 4];
+        let plan = balance_movements(&roster, &replicas);
+        assert_eq!(plan, balance_movements(&roster, &replicas));
+        assert!(!plan.is_empty());
+        for movement in plan {
+            let voters = replicas.get_mut(&movement.key).unwrap();
+            assert!(!voters.contains(&movement.to));
+            *voters.iter_mut().find(|id| **id == movement.from).unwrap() = movement.to;
+        }
+        assert!(replicas.values().all(|ids| ids.len() == 3));
+        assert!(balance_movements(&roster, &replicas).is_empty());
+        assert!(replicas.values().any(|ids| ids.contains(&4)));
+    }
+
+    #[test]
+    fn group_shard_mapping_is_stable() {
+        for (id, shard) in [("a", 0), ("b", 1), ("c", 2), ("d", 3), ("группа", 1)] {
+            assert_eq!(coordinator(id), group_shard(shard));
+        }
+    }
+
+    #[test]
+    fn coordinator_failure_before_durable_majority_preserves_previous_offset() -> Result<()> {
+        let mut cluster = TestCluster::open()?;
+        let leader = cluster.leader()?;
+        let partition = Key {
+            topic: Uuid::new_v4(),
+            partition: 0,
+        };
+        let mut confirmed = cluster.write(leader, partition, 4)?;
+        cluster.pump()?;
+        confirmed.try_recv()?.expect("confirmed offset");
+        assert_eq!(cluster.read(leader, partition)?, 4);
+
+        // The entry is durable on the leader. Withhold all replication, then
+        // crash that leader. Its queued messages cannot reach the survivors.
+        let mut unconfirmed = cluster.write(leader, partition, 8)?;
+        let log = cluster.brokers[leader].as_ref().unwrap().nodes[&coordinator(GROUP)].log();
+        assert!(log.durable().next_index > log.committed().next_index);
+        assert!(matches!(unconfirmed.try_recv(), Err(TryRecvError::Empty)));
+        drop(cluster.brokers[leader].take());
+        let next = cluster.leader()?;
+        assert_eq!(cluster.read(next, partition)?, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn coordinator_failure_after_durable_majority_preserves_offset_with_lost_response() -> Result<()>
+    {
+        let mut cluster = TestCluster::open()?;
+        let leader = cluster.leader()?;
+        let partition = Key {
+            topic: Uuid::new_v4(),
+            partition: 0,
+        };
+        let response = cluster.write(leader, partition, 9)?;
+        // Simulate the requester disconnecting while the commit is in flight.
+        // Stop delivery as soon as the leader commits. Followers may have
+        // persisted the entry without receiving the updated commit index.
+        drop(response);
+        let key = coordinator(GROUP);
+        cluster.pump_until(|cluster| {
+            cluster.brokers[leader].as_ref().unwrap().nodes[&key]
+                .pending
+                .is_none()
+        })?;
+        let node = &cluster.brokers[leader].as_ref().unwrap().nodes[&key];
+        let next_index = node.log().committed().next_index;
+        assert_eq!(
+            node.group.as_ref().unwrap().committed[GROUP].offsets[&partition].value,
+            9
+        );
+        assert!(cluster.brokers.iter().enumerate().any(|(index, broker)| {
+            let log = broker.as_ref().unwrap().nodes[&key].log();
+            index != leader
+                && log.durable().next_index >= next_index
+                && log.committed().next_index < next_index
+        }));
+        drop(cluster.brokers[leader].take());
+        let next = cluster.leader()?;
+        assert_eq!(cluster.read(next, partition)?, 9);
+        Ok(())
     }
 }

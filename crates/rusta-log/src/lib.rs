@@ -369,26 +369,43 @@ impl PartitionLog {
         &self,
         target: i64,
         payload: &mut Vec<u8>,
+        decode: impl FnMut(Entry, &[u8], i64) -> io::Result<Option<i64>>,
+    ) -> io::Result<Option<i64>> {
+        self.offset_for_timestamp_from(self.start().next_offset, target, payload, decode)
+    }
+
+    /// Find a timestamp within a Kafka-visible suffix of the committed log.
+    pub fn offset_for_timestamp_from(
+        &self,
+        start: i64,
+        target: i64,
+        payload: &mut Vec<u8>,
         mut decode: impl FnMut(Entry, &[u8], i64) -> io::Result<Option<i64>>,
     ) -> io::Result<Option<i64>> {
         self.ensure_available()?;
-        for segment in &self.segments {
+        if !(self.start().next_offset..=self.committed().next_offset).contains(&start) {
+            return Err(invalid("timestamp search starts outside the committed log"));
+        }
+        let first = self
+            .segments
+            .partition_point(|segment| segment.end.next_offset <= start);
+        for segment in &self.segments[first..] {
             if segment.start.next_index >= self.committed().next_index {
                 break;
             }
             if segment.max_record_timestamp < target {
                 continue;
             }
-            let mut scan = segment.scan(
-                &self.root,
-                segment.start.next_index,
-                segment.start.next_offset,
-            )?;
+            let mut scan =
+                segment.scan(&self.root, u64::MAX, start.max(segment.start.next_offset))?;
             while let Some(entry) = scan.next(payload)? {
                 if entry.position.next_index >= self.committed().next_index {
                     break;
                 }
-                if entry.record_count == 0 || batch_max_timestamp(payload) < target {
+                if entry.record_count == 0
+                    || entry.position.next_offset < start
+                    || batch_max_timestamp(payload) < target
+                {
                     continue;
                 }
                 if let Some(offset) = decode(entry, payload, target)? {
@@ -469,6 +486,50 @@ impl PartitionLog {
         Err(corrupt("requested entries are missing"))
     }
 
+    /// Select a segment boundary without changing the physical log.
+    /// Raft callers must commit the selected position before using it for reads.
+    pub fn retention_boundary(&self, start: Position, policy: Retention) -> io::Result<Position> {
+        self.ensure_available()?;
+        if self.end() != self.committed()
+            || !(self.start().next_index..=self.committed().next_index).contains(&start.next_index)
+        {
+            return Err(invalid("retention requires a committed suffix"));
+        }
+        let first = self
+            .segments
+            .partition_point(|segment| segment.end.next_index <= start.next_index);
+        let segments = &self.segments[first..];
+        let mut prefix_bytes = 0;
+        if let Some(segment) = segments.first()
+            && segment.start.next_index < start.next_index
+        {
+            let mut scan = segment.scan(&self.root, start.next_index, i64::MAX)?;
+            prefix_bytes = scan.byte_position();
+            let mut payload = Vec::new();
+            while let Some(entry) = scan.next(&mut payload)? {
+                if entry.position.next_index == start.next_index {
+                    break;
+                }
+                prefix_bytes = scan.byte_position();
+            }
+        }
+        let mut bytes = segments.iter().map(|segment| segment.bytes).sum::<u64>() - prefix_bytes;
+        let mut boundary = start;
+        for (index, segment) in segments.iter().enumerate() {
+            let expired = policy
+                .keep_since_ms
+                .is_some_and(|cutoff| segment.max_append_timestamp < cutoff);
+            let oversized =
+                index + 1 < segments.len() && policy.max_bytes.is_some_and(|limit| bytes > limit);
+            if !expired && !oversized {
+                break;
+            }
+            boundary = segment.end;
+            bytes -= segment.bytes - if index == 0 { prefix_bytes } else { 0 };
+        }
+        Ok(boundary)
+    }
+
     /// Apply singleton retention to a committed log and return the number of removed segments.
     pub fn apply_retention(&mut self, policy: Retention) -> io::Result<usize> {
         self.apply_retention_after(policy, || Ok(()))
@@ -480,30 +541,10 @@ impl PartitionLog {
         policy: Retention,
         before_removal: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<usize> {
-        self.ensure_available()?;
-        if self.end() != self.committed() {
-            return Err(invalid(
-                "commit or truncate the local suffix before applying retention",
-            ));
-        }
-        let mut bytes = self
+        let boundary = self.retention_boundary(self.start(), policy)?;
+        let removed = self
             .segments
-            .iter()
-            .map(|segment| segment.bytes)
-            .sum::<u64>();
-        let mut removed = 0;
-        for (index, segment) in self.segments.iter().enumerate() {
-            let expired = policy
-                .keep_since_ms
-                .is_some_and(|cutoff| segment.max_append_timestamp < cutoff);
-            let oversized = index + 1 < self.segments.len()
-                && policy.max_bytes.is_some_and(|limit| bytes > limit);
-            if !expired && !oversized {
-                break;
-            }
-            removed += 1;
-            bytes -= segment.bytes;
-        }
+            .partition_point(|segment| segment.end.next_index <= boundary.next_index);
         if removed == 0 {
             return Ok(0);
         }
@@ -526,7 +567,8 @@ impl PartitionLog {
         })
     }
 
-    fn position_at(&self, index: u64) -> io::Result<Position> {
+    /// Resolve an exact consensus index to its Kafka position.
+    pub fn position_at(&self, index: u64) -> io::Result<Position> {
         if index == self.end().next_index {
             return Ok(self.end());
         }

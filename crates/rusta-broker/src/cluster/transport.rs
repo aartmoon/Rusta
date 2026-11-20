@@ -35,7 +35,7 @@ pub enum Packet {
     Leaders(Bytes),
     Join,
     Drain,
-    Moved(Movement),
+    Moved(Uuid, Movement),
 }
 
 pub struct Queued {
@@ -44,12 +44,17 @@ pub struct Queued {
 }
 
 impl Queued {
+    #[cfg(test)]
+    pub(super) fn into_packet(self) -> Packet {
+        self.packet
+    }
+
     pub fn send(queue: &mpsc::Sender<Self>, budget: &Arc<Semaphore>, packet: Packet) {
         let size = match &packet {
             Packet::Raft(_, message) => message.compute_size() as usize + GROUP,
             Packet::Leaders(report) => report.len(),
             Packet::Join | Packet::Drain => 0,
-            Packet::Moved(_) => MOVE,
+            Packet::Moved(..) => MOVE,
         } + HEADER;
         if size <= MAX_PACKET
             && let Ok(permit) = budget.clone().try_acquire_many_owned(size as u32)
@@ -67,7 +72,8 @@ type Receivers = HashMap<u64, mpsc::Receiver<Queued>>;
 const MAX_PACKET: usize = 2 * 1024 * 1024 + 65536;
 const HEADER: usize = 49;
 const GROUP: usize = 20;
-const MOVE: usize = GROUP + 16;
+const LEGACY_MOVE: usize = GROUP + 16;
+const MOVE: usize = LEGACY_MOVE + 16;
 const REPORT_ITEM: usize = GROUP + 4;
 const DEADLINE: Duration = Duration::from_secs(2);
 
@@ -200,12 +206,13 @@ async fn outbound(
                     Packet::Leaders(data) => (3, None, data.clone()),
                     Packet::Join => (4, None, Bytes::new()),
                     Packet::Drain => (5, None, Bytes::new()),
-                    Packet::Moved(movement) => {
+                    Packet::Moved(id, movement) => {
                         let mut body = BytesMut::with_capacity(MOVE);
                         body.extend_from_slice(movement.key.topic.as_bytes());
                         body.put_u32(movement.key.partition);
                         body.put_u64(movement.from);
                         body.put_u64(movement.to);
+                        body.extend_from_slice(id.as_bytes());
                         (6, None, body.freeze())
                     }
                 };
@@ -293,7 +300,7 @@ async fn inbound(
             3 => {
                 let (items, tail) = body.as_chunks::<REPORT_ITEM>();
                 ensure!(
-                    tail.is_empty() && items.len() <= 128,
+                    tail.is_empty() && items.len() <= 132,
                     "invalid leader report"
                 );
                 let entries = items
@@ -322,14 +329,22 @@ async fn inbound(
                     .await?;
             }
             6 => {
-                ensure!(body.len() == MOVE, "invalid replica movement report");
+                ensure!(
+                    body.len() == MOVE || body.len() == LEGACY_MOVE,
+                    "invalid replica movement report"
+                );
                 let movement = Movement {
                     key: group_id(body)?,
                     from: u64::from_be_bytes(body[GROUP..GROUP + 8].try_into()?),
-                    to: u64::from_be_bytes(body[GROUP + 8..].try_into()?),
+                    to: u64::from_be_bytes(body[GROUP + 8..LEGACY_MOVE].try_into()?),
+                };
+                let id = if body.len() == MOVE {
+                    Uuid::from_slice(&body[LEGACY_MOVE..])?
+                } else {
+                    Uuid::nil()
                 };
                 cluster
-                    .call(move |engine| engine.receive_move(source, movement))
+                    .call(move |engine| engine.receive_move(source, id, movement))
                     .await?;
             }
             _ => anyhow::bail!("unsupported peer protocol"),

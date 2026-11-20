@@ -15,9 +15,9 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::protocol::Error;
-pub use store::{Key, Offset, OffsetBudget};
+pub use store::{Completion, Event, Key, Offset, OffsetBudget};
 
-use store::{Event, JOURNAL_RETENTION, Offsets, Store};
+use store::{JOURNAL_RETENTION, LocalStore, Offsets, Store};
 
 const MAX_GROUPS: usize = 256;
 const MAX_MEMBERS: usize = 32;
@@ -32,6 +32,8 @@ pub struct Groups {
     pub entries: HashMap<String, Group>,
     store: Store,
     retention_ms: u64,
+    max_groups: usize,
+    max_members: usize,
 }
 
 #[derive(Default)]
@@ -96,13 +98,13 @@ fn str_bytes(value: &str) -> StrBytes {
     StrBytes::from_string(value.to_owned())
 }
 
-fn join_error(error: Error) -> messages::JoinGroupResponse {
+pub fn join_error(error: Error) -> messages::JoinGroupResponse {
     messages::JoinGroupResponse::default()
         .with_error_code(error as i16)
         .with_generation_id(-1)
 }
 
-fn sync_error(error: Error) -> messages::SyncGroupResponse {
+pub fn sync_error(error: Error) -> messages::SyncGroupResponse {
     messages::SyncGroupResponse::default().with_error_code(error as i16)
 }
 
@@ -112,17 +114,56 @@ fn send<T>(sender: oneshot::Sender<T>, value: T) {
 
 impl Groups {
     pub fn open(path: &Path) -> Result<Self> {
-        let retention_ms = match std::env::var("RUSTA_GROUP_OFFSET_RETENTION_MS") {
-            Ok(value) => value.parse()?,
-            Err(std::env::VarError::NotPresent) => DEFAULT_RETENTION_MS,
-            Err(error) => return Err(error.into()),
-        };
-        let (store, entries) = Store::open(path)?;
+        let retention_ms = retention_ms()?;
+        let (store, entries) = LocalStore::open(path)?;
         Ok(Self {
             entries,
-            store,
+            store: Store::Local(store),
             retention_ms,
+            max_groups: MAX_GROUPS,
+            max_members: MAX_NODE_MEMBERS,
         })
+    }
+
+    pub fn replicated(
+        shards: usize,
+        retention_ms: u64,
+        committed: &HashMap<String, Group>,
+    ) -> Self {
+        Self {
+            entries: committed
+                .iter()
+                .map(|(id, group)| {
+                    (
+                        id.clone(),
+                        Group {
+                            generation: group.generation,
+                            offsets: group.offsets.clone(),
+                            empty_since: group.empty_since,
+                            ..Group::default()
+                        },
+                    )
+                })
+                .collect(),
+            store: Store::Replicated {
+                events: Vec::new(),
+                completions: Vec::new(),
+            },
+            retention_ms,
+            max_groups: MAX_GROUPS / shards,
+            max_members: MAX_NODE_MEMBERS / shards,
+        }
+    }
+
+    pub fn take_events(&mut self) -> (Vec<Event>, Vec<Completion>) {
+        let Store::Replicated {
+            events,
+            completions,
+        } = &mut self.store
+        else {
+            unreachable!("cluster events require a replicated store");
+        };
+        (std::mem::take(events), std::mem::take(completions))
     }
 
     pub fn join(
@@ -172,7 +213,7 @@ impl Groups {
 
         let known = self.entries.get(id);
         if request.member_id.is_empty() {
-            if (known.is_none() && self.entries.len() >= MAX_GROUPS)
+            if (known.is_none() && self.entries.len() >= self.max_groups)
                 || known
                     .is_some_and(|group| group.members.len() + group.pending.len() >= MAX_MEMBERS)
                 || self
@@ -180,7 +221,7 @@ impl Groups {
                     .values()
                     .map(|group| group.members.len() + group.pending.len())
                     .sum::<usize>()
-                    >= MAX_NODE_MEMBERS
+                    >= self.max_members
             {
                 return Err(Error::GroupMaxSizeReached);
             }
@@ -270,7 +311,7 @@ impl Groups {
             && member.is_empty()
             && group.is_none_or(|group| group.members.is_empty())
         {
-            if group.is_none() && self.entries.len() >= MAX_GROUPS {
+            if group.is_none() && self.entries.len() >= self.max_groups {
                 return Err(Error::GroupMaxSizeReached);
             }
             return Ok(());
@@ -308,6 +349,7 @@ impl Groups {
     pub fn maintain(&mut self, retain_offsets: bool) {
         let now = Instant::now();
         let time = now_ms();
+        let replicated = matches!(self.store, Store::Replicated { .. });
         let mut expired = Vec::new();
         for (id, group) in &mut self.entries {
             if let Err(error) = group.advance(id, &mut self.store, now) {
@@ -315,6 +357,13 @@ impl Groups {
             }
             if group.members.is_empty() && group.pending.is_empty() {
                 let transient = group.generation == 0 && group.offsets.is_empty();
+                if replicated
+                    && !transient
+                    && group.empty_since.is_none()
+                    && let Err(error) = group.make_empty(id, &mut self.store)
+                {
+                    group.fail_waiters(group_storage(error));
+                }
                 let eligible = retain_offsets
                     && group
                         .empty_since
@@ -330,6 +379,9 @@ impl Groups {
                     expired.push(id.clone());
                 }
             }
+            if self.store.has_events() {
+                break;
+            }
         }
         for group in expired {
             self.entries.remove(&group);
@@ -338,6 +390,18 @@ impl Groups {
             eprintln!("group checkpoint: {error:#}");
         }
     }
+}
+
+pub fn retention_ms() -> Result<u64> {
+    match std::env::var("RUSTA_GROUP_OFFSET_RETENTION_MS") {
+        Ok(value) => Ok(value.parse()?),
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_RETENTION_MS),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn apply_event(entries: &mut HashMap<String, Group>, event: Event) -> std::io::Result<()> {
+    store::apply(entries, event)
 }
 
 pub fn group_storage(error: anyhow::Error) -> Error {
@@ -601,7 +665,11 @@ impl Group {
             .filter_map(|(id, member)| member.join.take().map(|waiter| (id.clone(), waiter)))
             .collect();
         for (id, waiter) in waiters {
-            send(waiter, self.join_response(&id));
+            store.after_commit(
+                waiter,
+                self.join_response(&id),
+                join_error(Error::NotCoordinator),
+            );
         }
         Ok(())
     }
@@ -677,7 +745,11 @@ impl Group {
                     send(sender, sync_error(error));
                     return;
                 }
-                send(sender, self.sync_response(member));
+                store.after_commit(
+                    sender,
+                    self.sync_response(member),
+                    sync_error(Error::NotCoordinator),
+                );
             }
             Phase::Completing { .. } if request.assignments.is_empty() => {
                 let state = self.members.get_mut(member).expect("validated member");
@@ -743,7 +815,11 @@ impl Group {
             }
         }
         for (id, waiter) in waiters {
-            send(waiter, self.sync_response(&id));
+            store.after_commit(
+                waiter,
+                self.sync_response(&id),
+                sync_error(Error::NotCoordinator),
+            );
         }
         Ok(())
     }

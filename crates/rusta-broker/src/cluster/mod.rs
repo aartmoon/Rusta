@@ -1,5 +1,7 @@
+pub mod admin;
 mod disk;
 mod engine;
+mod groups;
 mod kafka;
 mod transport;
 
@@ -11,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use rusta_kafka::protocol::StrBytes;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use uuid::Uuid;
 
 use crate::protocol::Endpoint;
@@ -151,6 +153,9 @@ fn endpoint(value: &str) -> Result<Endpoint> {
 pub struct Cluster {
     engine: Mutex<Option<Engine>>,
     worker: Arc<Semaphore>,
+    data_available: Arc<Notify>,
+    group_progress: Arc<Notify>,
+    fetch_waiters: Semaphore,
 }
 
 pub fn request_decommission(root: &Path) -> Result<()> {
@@ -175,10 +180,14 @@ impl Cluster {
         let (outbound, routes) = transport::routes(&settings);
         let node = Engine::open(settings.clone(), root, outbound)?;
         let cluster = Arc::new(Self {
+            data_available: node.data_available.clone(),
+            group_progress: node.group_progress.clone(),
+            fetch_waiters: Semaphore::new(crate::WAITING_FETCHES),
             engine: Mutex::new(Some(node)),
             worker: Arc::new(Semaphore::new(1)),
         });
         transport::start(settings, tls, routes, cluster.clone()).await?;
+        admin::start(root, cluster.clone())?;
         let ticking = cluster.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(50));

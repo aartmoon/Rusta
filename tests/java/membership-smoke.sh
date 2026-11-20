@@ -39,6 +39,58 @@ done
 test -f "$scratch/ready"
 "${compose[@]}" up -d --wait broker4
 run expanded 127.0.0.1:19395
+run leadership 127.0.0.1:19395
+source="$(sed -n '1p' "$scratch/transfer")"
+target="$(sed -n '2p' "$scratch/transfer")"
+admin() {
+    local broker="$1"
+    shift
+    "${compose[@]}" exec -T "broker$broker" /usr/local/bin/rusta "$@"
+}
+if admin "$source" transfer-leadership before-node-four 0 4; then
+    printf 'Unexpected transfer to a nonvoter
+' >&2
+    exit 1
+fi
+# Let the catch-up precondition settle between concurrent Produce operations.
+for ((attempt=0; attempt<80; attempt++)); do
+    if admin "$source" transfer-leadership before-node-four 0 "$target"; then break; fi
+    sleep 0.1
+done
+run transferred 127.0.0.1:19395
+
+"${compose[@]}" kill -s SIGKILL broker4
+run controller 127.0.0.1:19392
+controller="$(cat "$scratch/controller")"
+request=6e0c4ca8-c1d9-4a76-9b45-a67badbd582d
+admin "$controller" rebalance "$request" | tee "$scratch/accepted"
+grep -Fq '"result": "accepted"' "$scratch/accepted"
+admin "$controller" rebalance "$request" | tee "$scratch/repeated"
+grep -Fq '"result": "accepted"' "$scratch/repeated"
+admin "$controller" relocation-status | tee "$scratch/paused"
+grep -Fq '"kind": "rebalance"' "$scratch/paused"
+grep -Fq '"to": 4' "$scratch/paused"
+
+"${compose[@]}" kill -s SIGKILL "broker$controller"
+"${compose[@]}" up -d --wait broker4
+run controller 127.0.0.1:19395
+replacement="$(cat "$scratch/controller")"
+test "$replacement" -ne "$controller"
+"${compose[@]}" up -d --wait "broker$controller"
+for ((attempt=0; attempt<150; attempt++)); do
+    admin 4 relocation-status > "$scratch/status"
+    if grep -Fq "\"last_rebalance\": \"$request\"" "$scratch/status"; then break; fi
+    kill -0 "$worker"
+    sleep 0.2
+done
+grep -Fq "\"last_rebalance\": \"$request\"" "$scratch/status"
+run controller 127.0.0.1:19395
+controller="$(cat "$scratch/controller")"
+admin "$controller" rebalance "$request" | tee "$scratch/completed"
+grep -Fq '"result": "completed"' "$scratch/completed"
+admin "$controller" rebalance 5a7a116f-8edc-417d-9755-d139c293f4fc | tee "$scratch/balanced"
+grep -Fq '"result": "balanced"' "$scratch/balanced"
+
 touch "$scratch/stop"
 wait "$worker"
 worker=""

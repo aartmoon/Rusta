@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use rusta_log::{Options, PartitionLog, Retention};
 use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use super::{Group, MAX_GROUPS, checkpoint, now_ms};
@@ -60,9 +61,64 @@ pub enum Event {
     },
 }
 
-pub struct Store {
+pub struct LocalStore {
     log: PartitionLog,
     path: PathBuf,
+}
+
+pub type Completion = Box<dyn FnOnce(bool) + Send>;
+
+pub enum Store {
+    Local(LocalStore),
+    Replicated {
+        events: Vec<Event>,
+        completions: Vec<Completion>,
+    },
+}
+
+impl Store {
+    pub fn append(&mut self, event: Event) -> Result<()> {
+        match self {
+            Self::Local(local) => local.append(event),
+            Self::Replicated { events, .. } => {
+                events.push(event);
+                Ok(())
+            }
+        }
+    }
+
+    pub fn after_commit<T: Send + 'static>(
+        &mut self,
+        sender: oneshot::Sender<T>,
+        response: T,
+        fenced: T,
+    ) {
+        match self {
+            Self::Local(_) => {
+                let _ = sender.send(response);
+            }
+            Self::Replicated { completions, .. } => {
+                completions.push(Box::new(move |committed| {
+                    let _ = sender.send(if committed { response } else { fenced });
+                }));
+            }
+        }
+    }
+
+    pub fn has_events(&self) -> bool {
+        matches!(self, Self::Replicated { events, .. } if !events.is_empty())
+    }
+
+    pub fn compact(
+        &mut self,
+        groups: &HashMap<String, Group>,
+        retention: Retention,
+    ) -> io::Result<usize> {
+        match self {
+            Self::Local(local) => local.compact(groups, retention),
+            Self::Replicated { .. } => Ok(0),
+        }
+    }
 }
 
 pub const JOURNAL_RETENTION: Retention = Retention {
@@ -70,7 +126,7 @@ pub const JOURNAL_RETENTION: Retention = Retention {
     keep_since_ms: None,
 };
 
-impl Store {
+impl LocalStore {
     pub fn open(path: &Path) -> Result<(Self, HashMap<String, Group>)> {
         let log = PartitionLog::open(
             path,
@@ -126,7 +182,7 @@ impl Store {
     }
 }
 
-fn apply(groups: &mut HashMap<String, Group>, event: Event) -> io::Result<()> {
+pub(super) fn apply(groups: &mut HashMap<String, Group>, event: Event) -> io::Result<()> {
     let group = match &event {
         Event::Generation { group, .. }
         | Event::Stable { group, .. }

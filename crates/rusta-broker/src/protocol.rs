@@ -25,7 +25,9 @@ pub enum Error {
     RequestTimedOut = 7,
     MessageTooLarge = 10,
     OffsetMetadataTooLarge = 12,
+    CoordinatorLoadInProgress = 14,
     CoordinatorNotAvailable = 15,
+    NotCoordinator = 16,
     InvalidRequiredAcks = 21,
     IllegalGeneration = 22,
     InconsistentGroupProtocol = 23,
@@ -633,7 +635,14 @@ pub fn topic_config(
 }
 
 pub fn lookup(log: &rusta_log::PartitionLog, timestamp: i64) -> Result<Option<(i64, i64)>, Error> {
-    let start = log.start().next_offset;
+    lookup_from(log, log.start().next_offset, timestamp)
+}
+
+pub fn lookup_from(
+    log: &rusta_log::PartitionLog,
+    start: i64,
+    timestamp: i64,
+) -> Result<Option<(i64, i64)>, Error> {
     match timestamp {
         -2 => Ok(Some((start, -1))),
         -1 => Ok(Some((log.committed().next_offset, -1))),
@@ -654,7 +663,7 @@ pub fn lookup(log: &rusta_log::PartitionLog, timestamp: i64) -> Result<Option<(i
         }
         time if time >= 0 => {
             let mut result = None;
-            log.offset_for_timestamp(time, &mut Vec::new(), |_, bytes, target| {
+            log.offset_for_timestamp_from(start, time, &mut Vec::new(), |_, bytes, target| {
                 let batch = Batch::parse(bytes).map_err(std::io::Error::other)?;
                 result = batch
                     .scan(bytes, target)

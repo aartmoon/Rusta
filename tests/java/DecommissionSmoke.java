@@ -4,6 +4,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
@@ -12,6 +13,7 @@ import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.TopicPartition;
@@ -36,6 +38,10 @@ public final class DecommissionSmoke {
                 for (int partition = 0; partition < PARTITIONS; partition++) {
                     send(producer, partition, 0);
                 }
+            }
+            try (var consumer = new KafkaConsumer<String, String>(GroupSmoke.consumer(endpoint, "drain-group"))) {
+                consumer.commitSync(Map.of(new TopicPartition(TOPIC, 0), new OffsetAndMetadata(1, "relocate")),
+                    GroupSmoke.TIMEOUT);
             }
             var topic = waitForPlacement(endpoint, INITIAL, 0);
             int leader = topic.partitions().stream().filter(p -> p.partitionIndex() == 0).findFirst().orElseThrow().leaderId();
@@ -84,6 +90,12 @@ public final class DecommissionSmoke {
             int stopped = mode.equals("quorum") ? Integer.parseInt(Files.readString(scratch.resolve("stopped")).trim()) : 0;
             waitForPlacement(endpoint, survivors, stopped);
             if (!mode.equals("placement")) {
+                var groupPartition = new TopicPartition(TOPIC, 0);
+                try (var consumer = new KafkaConsumer<String, String>(GroupSmoke.consumer(endpoint, "drain-group"))) {
+                    var offset = consumer.committed(Set.of(groupPartition), GroupSmoke.TIMEOUT).get(groupPartition);
+                    GroupSmoke.check(offset != null && offset.offset() == 1 && "relocate".equals(offset.metadata()),
+                        "consumer commit was lost during shard relocation");
+                }
                 int end = Integer.parseInt(Files.readString(scratch.resolve("committed")));
                 verify(endpoint, 0, end);
                 for (int partition = 1; partition < PARTITIONS; partition++) {

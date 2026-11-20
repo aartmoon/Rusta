@@ -17,7 +17,7 @@ trap cleanup EXIT
 
 mvn -B -q -f tests/java/pom.xml org.apache.maven.plugins:maven-dependency-plugin:3.8.1:copy-dependencies \
     "-DoutputDirectory=$scratch/deps"
-javac -cp "$scratch/deps/*" -d "$scratch" tests/java/Smoke.java tests/java/GroupSmoke.java tests/java/SpringSmoke.java
+javac -cp "$scratch/deps/*" -d "$scratch" tests/java/{Smoke,GroupSmoke,GroupWireSmoke,SpringSmoke}.java
 
 "${compose[@]}" up -d --wait --build
 broker="$("${compose[@]}" ps -q broker)"

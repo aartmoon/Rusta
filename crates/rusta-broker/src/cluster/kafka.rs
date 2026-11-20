@@ -8,17 +8,20 @@ use rusta_kafka::{
     messages::{self, BrokerId, ProducerId, TopicName},
     protocol::StrBytes,
 };
-use tokio::{sync::oneshot, time::timeout};
+use tokio::{
+    sync::oneshot,
+    time::{Instant, timeout, timeout_at},
+};
 use uuid::Uuid;
 
-use crate::protocol::{Error, lookup, topic_config};
+use crate::protocol::{Error, lookup_from, topic_config};
 
 use super::{
     Cluster,
     engine::{CONTROL, Engine, GroupId, Node, Write},
 };
 
-const DEADLINE: Duration = Duration::from_secs(3);
+pub(super) const DEADLINE: Duration = Duration::from_secs(3);
 const FETCH_MAX: usize = 4 * 1024 * 1024;
 
 fn code(error: Option<Error>) -> i16 {
@@ -31,7 +34,7 @@ fn broker(id: u64) -> BrokerId {
     BrokerId(if id == 0 { -1 } else { id as i32 })
 }
 
-async fn reply<T>(receiver: oneshot::Receiver<Result<T, Error>>) -> Result<T, Error> {
+pub(super) async fn reply<T>(receiver: oneshot::Receiver<Result<T, Error>>) -> Result<T, Error> {
     timeout(DEADLINE, receiver)
         .await
         .map_err(|_| Error::RequestTimedOut)?
@@ -44,19 +47,17 @@ impl Cluster {
         head: &Header,
         request: Request,
         internal: bool,
+        client_host: String,
     ) -> Result<Option<Bytes>> {
         let version = head.version;
         let response = match request {
             Request::ApiVersions(_) | Request::UnsupportedApiVersions => {
                 let unsupported = matches!(request, Request::UnsupportedApiVersions);
-                let mut versions = api_versions(if unsupported {
+                let versions = api_versions(if unsupported {
                     Error::UnsupportedVersion as i16
                 } else {
                     0
                 });
-                versions
-                    .api_keys
-                    .retain(|api| !(8..=16).contains(&api.api_key));
                 encode(head, if unsupported { 0 } else { version }, &versions)?
             }
             Request::CreateTopics(request) => {
@@ -89,7 +90,39 @@ impl Cluster {
             Request::OffsetForLeaderEpoch(request) => {
                 encode(head, version, &self.epoch_offsets(request).await?)?
             }
-            _ => anyhow::bail!("requested API is not available in cluster mode"),
+            Request::FindCoordinator(request) => encode(
+                head,
+                version,
+                &self.find_coordinator(request, version, internal).await?,
+            )?,
+            Request::JoinGroup(request) => {
+                let mut response = self
+                    .join_group(request, head.client_id.clone(), client_host)
+                    .await?;
+                if version == 6 && response.protocol_name.is_none() {
+                    response.protocol_name = Some(StrBytes::default());
+                }
+                encode(head, version, &response)?
+            }
+            Request::SyncGroup(request) => encode(head, version, &self.sync_group(request).await?)?,
+            Request::Heartbeat(request) => encode(head, version, &self.heartbeat(request).await?)?,
+            Request::LeaveGroup(request) => {
+                encode(head, version, &self.leave_group(request).await?)?
+            }
+            Request::OffsetCommit(request) => {
+                encode(head, version, &self.offset_commit(request).await?)?
+            }
+            Request::OffsetFetch(request) => {
+                encode(head, version, &self.offset_fetch(request, version).await?)?
+            }
+            Request::DescribeGroups(request) => encode(
+                head,
+                version,
+                &self.describe_groups(request, version).await?,
+            )?,
+            Request::ListGroups(request) => {
+                encode(head, version, &self.list_groups(request).await?)?
+            }
         };
         Ok(Some(response))
     }
@@ -124,13 +157,10 @@ impl Cluster {
                             &topic.with_replication_factor(1),
                             engine.cap().saturating_sub(engine.partitions()),
                         )?;
-                        if cfg.retention_bytes.is_some_and(|limit| limit != -1)
-                            || cfg.retention_ms.is_some_and(|limit| limit != -1)
-                            || cfg.allow_weak_acks
-                        {
+                        if cfg.allow_weak_acks {
                             return Err(Error::InvalidConfig);
                         }
-                        cfg.retention_ms = Some(-1);
+                        cfg.retention_ms.get_or_insert(-1);
                         Ok((cfg, factor))
                     })();
                     Ok(outcome)
@@ -278,7 +308,9 @@ impl Cluster {
             return Ok(Err(error));
         }
         self.call(move |engine| {
-            let node = &engine.nodes[&key];
+            let Some(node) = engine.nodes.get(&key) else {
+                return Ok(Err(Error::NotLeader));
+            };
             if !node.local_leader() || node.epoch() != epoch {
                 return Ok(Err(Error::NotLeader));
             }
@@ -292,7 +324,6 @@ impl Cluster {
         request: messages::FetchRequest,
         version: i16,
     ) -> Result<messages::FetchResponse> {
-        use messages::fetch_response::{FetchableTopicResponse, PartitionData};
         if request.session_id != 0 {
             return Ok(messages::FetchResponse::default()
                 .with_error_code(Error::FetchSessionNotFound as i16));
@@ -300,56 +331,92 @@ impl Cluster {
         if request.replica_id.0 != -1
             || ![0, 1].contains(&request.isolation_level)
             || request.max_bytes < 0
+            || request.min_bytes < 0
+            || request.max_wait_ms < 0
         {
             return Ok(
                 messages::FetchResponse::default().with_error_code(Error::InvalidRequest as i16)
             );
         }
+        let minimum = (request.min_bytes as usize).min(FETCH_MAX);
+        let deadline =
+            Instant::now() + Duration::from_millis(request.max_wait_ms.min(2_000) as u64);
+        let wait_slot = self.fetch_waiters.try_acquire().ok();
+        loop {
+            let notified = self.data_available.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let (response, used, failed) = self
+                .fetch_once(&request, version, deadline + DEADLINE)
+                .await?;
+            if failed || used >= minimum || wait_slot.is_none() || Instant::now() >= deadline {
+                return Ok(response);
+            }
+            drop(response);
+            let _ = timeout_at(deadline, notified).await;
+        }
+    }
+
+    async fn fetch_once(
+        self: &Arc<Self>,
+        request: &messages::FetchRequest,
+        version: i16,
+        deadline: Instant,
+    ) -> Result<(messages::FetchResponse, usize, bool)> {
+        use messages::fetch_response::{FetchableTopicResponse, PartitionData};
+        let mut failed = false;
         let maximum = (request.max_bytes as usize).min(FETCH_MAX);
         let mut used = 0;
         let mut responses = Vec::new();
-        for topic in request.topics {
+        for topic in &request.topics {
             let mut partitions = Vec::new();
-            for part in topic.partitions {
+            for part in topic.partitions.iter().cloned() {
                 let mut response = PartitionData::default().with_partition_index(part.partition);
                 let name = (version == 12).then(|| topic.topic.0.as_str().to_owned());
                 let remaining = maximum
                     .saturating_sub(used)
                     .min(part.partition_max_bytes.max(0) as usize);
                 let first = used == 0;
-                let result = self
-                    .guarded(
-                        name,
-                        topic.topic_id,
-                        part.partition,
-                        part.current_leader_epoch,
-                        move |node| {
-                            let log = node.log();
-                            let start = log.start().next_offset;
-                            let end = log.committed().next_offset;
-                            if !(start..=end).contains(&part.fetch_offset) {
-                                return Err(Error::OffsetOutOfRange);
+                let read = self.guarded(
+                    name,
+                    topic.topic_id,
+                    part.partition,
+                    part.current_leader_epoch,
+                    move |node| {
+                        let log = node.log();
+                        let start = node.log_start();
+                        let end = log.committed().next_offset;
+                        if !(start..=end).contains(&part.fetch_offset) {
+                            return Ok((start, end, Bytes::new(), Some(Error::OffsetOutOfRange)));
+                        }
+                        if part.partition_max_bytes < 0 {
+                            return Err(Error::InvalidRequest);
+                        }
+                        let mut records = BytesMut::new();
+                        log.visit_batches(part.fetch_offset, &mut Vec::new(), |_, bytes| {
+                            if (!first || !records.is_empty())
+                                && records.len() + bytes.len() > remaining
+                            {
+                                return Ok(false);
                             }
-                            if part.partition_max_bytes < 0 {
-                                return Err(Error::InvalidRequest);
-                            }
-                            let mut records = BytesMut::new();
-                            log.visit_batches(part.fetch_offset, &mut Vec::new(), |_, bytes| {
-                                if (!first || !records.is_empty())
-                                    && records.len() + bytes.len() > remaining
-                                {
-                                    return Ok(false);
-                                }
-                                records.extend_from_slice(bytes);
-                                Ok(records.len() < remaining)
-                            })
-                            .map_err(Error::storage)?;
-                            Ok((start, end, records.freeze()))
-                        },
-                    )
-                    .await?;
+                            records.extend_from_slice(bytes);
+                            Ok(records.len() < remaining)
+                        })
+                        .map_err(Error::storage)?;
+                        Ok((start, end, records.freeze(), None))
+                    },
+                );
+                let result = if Instant::now() >= deadline {
+                    Err(Error::RequestTimedOut)
+                } else {
+                    match timeout_at(deadline, read).await {
+                        Ok(result) => result?,
+                        Err(_) => Err(Error::RequestTimedOut),
+                    }
+                };
                 match result {
-                    Ok((start, end, records)) => {
+                    Ok((start, end, records, error)) => {
+                        response.error_code = code(error);
                         response.log_start_offset = start;
                         response.high_watermark = end;
                         response.last_stable_offset = end;
@@ -358,16 +425,21 @@ impl Cluster {
                     }
                     Err(error) => response.error_code = error as i16,
                 }
+                failed |= response.error_code != 0;
                 partitions.push(response);
             }
             responses.push(
                 FetchableTopicResponse::default()
-                    .with_topic(topic.topic)
+                    .with_topic(topic.topic.clone())
                     .with_topic_id(topic.topic_id)
                     .with_partitions(partitions),
             );
         }
-        Ok(messages::FetchResponse::default().with_responses(responses))
+        Ok((
+            messages::FetchResponse::default().with_responses(responses),
+            used,
+            failed,
+        ))
     }
 
     async fn list_offsets(
@@ -396,7 +468,7 @@ impl Cluster {
                             {
                                 return Err(Error::InvalidRequest);
                             }
-                            lookup(node.log(), part.timestamp).map(|value| {
+                            lookup_from(node.log(), node.log_start(), part.timestamp).map(|value| {
                                 value.map(|(offset, time)| (offset, time, node.epoch()))
                             })
                         },
@@ -451,23 +523,20 @@ impl Cluster {
                             if part.leader_epoch >= node.epoch() {
                                 return Ok((node.epoch(), log.committed().next_offset));
                             }
-                            let mut value = (-1, log.start().next_offset);
-                            log.visit_batches(
-                                log.start().next_offset,
-                                &mut Vec::new(),
-                                |entry, _| {
-                                    if entry.term > part.leader_epoch as u64 {
-                                        return Ok(false);
-                                    }
-                                    value = (
-                                        entry.term as i32,
-                                        entry.position.next_offset + i64::from(entry.record_count),
-                                    );
-                                    Ok(true)
-                                },
-                            )
+                            let physical_start = log.start().next_offset;
+                            let mut value = (-1, physical_start);
+                            log.visit_batches(physical_start, &mut Vec::new(), |entry, _| {
+                                if entry.term > part.leader_epoch as u64 {
+                                    return Ok(false);
+                                }
+                                value = (
+                                    entry.term as i32,
+                                    entry.position.next_offset + i64::from(entry.record_count),
+                                );
+                                Ok(true)
+                            })
                             .map_err(Error::storage)?;
-                            Ok(value)
+                            Ok((value.0, value.1.max(node.log_start())))
                         },
                     )
                     .await?;

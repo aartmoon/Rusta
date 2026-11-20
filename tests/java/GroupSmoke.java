@@ -20,9 +20,10 @@ public final class GroupSmoke {
 
     public static void main(String[] args) throws Exception {
         String endpoint = args[1];
+        short replication = args.length > 2 ? Short.parseShort(args[2]) : 1;
         if (args[0].equals("write")) {
             try (Admin admin = Admin.create(base(endpoint))) {
-                admin.createTopics(List.of(new NewTopic(TOPIC, 4, (short) 1))).all().get(10, TimeUnit.SECONDS);
+                admin.createTopics(List.of(new NewTopic(TOPIC, 4, replication))).all().get(10, TimeUnit.SECONDS);
             }
             try (KafkaProducer<String, String> producer = new KafkaProducer<>(producer(endpoint))) {
                 for (var partition : PARTITIONS) {
@@ -64,11 +65,13 @@ public final class GroupSmoke {
                     revokeCount.addAndGet(partitions.size());
                 }
             });
-            var consumed = new HashSet<Integer>();
-            until(() -> consumed.size() == 4, () -> first.poll(Duration.ofMillis(100)).forEach(
-                record -> consumed.add(record.partition())));
+            var epochs = new HashMap<Integer, Optional<Integer>>();
+            until(() -> epochs.size() == 4, () -> first.poll(Duration.ofMillis(100)).forEach(
+                record -> epochs.put(record.partition(), record.leaderEpoch())));
             var offsets = new HashMap<TopicPartition, OffsetAndMetadata>();
-            for (var partition : PARTITIONS) offsets.put(partition, new OffsetAndMetadata(1, Optional.of(0), "checkpoint"));
+            for (var partition : PARTITIONS) {
+                offsets.put(partition, new OffsetAndMetadata(1, epochs.get(partition.partition()), "checkpoint"));
+            }
             first.commitSync(offsets, TIMEOUT);
 
             try (KafkaConsumer<String, String> second = new KafkaConsumer<>(properties)) {

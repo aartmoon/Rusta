@@ -441,3 +441,46 @@ fn failed_checkpoint_never_publishes_synced_data() -> io::Result<()> {
     assert!(log.batch_at(1, &mut Vec::new())?.is_none());
     Ok(())
 }
+
+#[test]
+fn logical_retention_keeps_raft_entries_and_respects_segment_boundaries() -> io::Result<()> {
+    let dir = TempDir::new()?;
+    let root = dir.path().join("partition");
+    let mut log = PartitionLog::open(&root, options(115))?;
+    for index in 0..3 {
+        log.append_batch(1, 100 + index, &batch(&[(index, index as u8)]))?;
+    }
+    log.commit()?;
+    let policy = Retention {
+        keep_since_ms: None,
+        max_bytes: Some(115),
+    };
+    let boundary = log.retention_boundary(log.start(), policy)?;
+    assert_eq!(boundary, position(3, 2));
+    assert_eq!(log.start(), position(1, 0));
+    assert_eq!(log.position_at(1)?, position(1, 0));
+
+    let mut payload = Vec::new();
+    let mut visited = Vec::new();
+    assert_eq!(
+        log.offset_for_timestamp_from(2, 0, &mut payload, |entry, _, _| {
+            visited.push(entry.position.next_offset);
+            Ok(Some(entry.position.next_offset))
+        })?,
+        Some(2),
+    );
+    assert_eq!(visited, vec![2]);
+
+    let expired = log.retention_boundary(
+        boundary,
+        Retention {
+            keep_since_ms: Some(200),
+            max_bytes: None,
+        },
+    )?;
+    assert_eq!(expired, log.committed());
+    log.append_internal(1, 0, b"retention record")?;
+    log.commit()?;
+    assert_eq!(log.retention_boundary(expired, policy)?.next_offset, 3);
+    Ok(())
+}

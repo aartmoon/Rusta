@@ -21,7 +21,7 @@ trap cleanup EXIT
 scripts/cluster-certs.sh "$RUSTA_CLUSTER_PKI"
 mvn -B -q -f tests/java/pom.xml org.apache.maven.plugins:maven-dependency-plugin:3.8.1:copy-dependencies \
     "-DoutputDirectory=$scratch/deps"
-javac -cp "$scratch/deps/*" -d "$scratch" tests/java/Smoke.java tests/java/GroupSmoke.java tests/java/ClusterSmoke.java
+javac -cp "$scratch/deps/*" -d "$scratch" tests/java/Smoke.java tests/java/GroupSmoke.java tests/java/ClusterSmoke.java tests/java/ClusterDataPathSmoke.java
 nodes="127.0.0.1:$RUSTA_PORT_1,127.0.0.1:$RUSTA_PORT_2,127.0.0.1:$RUSTA_PORT_3"
 java_test() {
     java -Dorg.slf4j.simpleLogger.defaultLogLevel=error -cp "$scratch:$scratch/deps/*" ClusterSmoke "$1" "$2" "$scratch" "$nodes"
@@ -66,3 +66,23 @@ for id in 1 2 3; do
     fi
 done
 java_test minority "$(endpoint "$third")"
+
+
+data_test() {
+    java -Dorg.slf4j.simpleLogger.defaultLogLevel=error -cp "$scratch:$scratch/deps/*" ClusterDataPathSmoke "$1" "$2" "$scratch"
+}
+"${compose[@]}" up -d --wait
+data_test write "$nodes"
+retention_leader="$(head -1 "$scratch/retention-leader")"
+"${compose[@]}" kill -s SIGKILL "broker$retention_leader"
+majority=""
+for id in 1 2 3; do
+    if [ "$id" != "$retention_leader" ]; then
+        majority="${majority}${majority:+,}$(endpoint "$id")"
+    fi
+done
+data_test failover "$majority"
+"${compose[@]}" up -d --wait "broker$retention_leader"
+"${compose[@]}" kill -s SIGKILL
+"${compose[@]}" up -d --wait
+data_test restart "$nodes"
