@@ -9,6 +9,15 @@ const API_RANGES: &[(i16, i16, i16)] = &[
     (1, 12, 13), // Fetch
     (2, 6, 7),   // ListOffsets
     (3, 9, 12),  // Metadata
+    (8, 8, 9),   // OffsetCommit
+    (9, 6, 9),   // OffsetFetch
+    (10, 3, 4),  // FindCoordinator
+    (11, 6, 9),  // JoinGroup
+    (12, 4, 4),  // Heartbeat
+    (13, 4, 5),  // LeaveGroup
+    (14, 4, 5),  // SyncGroup
+    (15, 5, 6),  // DescribeGroups
+    (16, 3, 5),  // ListGroups
     (18, 0, 4),  // ApiVersions
     (19, 5, 7),  // CreateTopics
     (22, 2, 4),  // InitProducerId
@@ -16,6 +25,15 @@ const API_RANGES: &[(i16, i16, i16)] = &[
 ];
 
 pub enum Request {
+    OffsetCommit(messages::OffsetCommitRequest),
+    OffsetFetch(messages::OffsetFetchRequest),
+    FindCoordinator(messages::FindCoordinatorRequest),
+    JoinGroup(messages::JoinGroupRequest),
+    Heartbeat(messages::HeartbeatRequest),
+    LeaveGroup(messages::LeaveGroupRequest),
+    SyncGroup(messages::SyncGroupRequest),
+    DescribeGroups(messages::DescribeGroupsRequest),
+    ListGroups(messages::ListGroupsRequest),
     ApiVersions(messages::ApiVersionsRequest),
     Metadata(messages::MetadataRequest),
     CreateTopics(messages::CreateTopicsRequest),
@@ -31,6 +49,7 @@ pub struct Header {
     pub key: i16,
     pub version: i16,
     pub correlation: i32,
+    pub client_id: String,
 }
 
 pub fn api_versions(error_code: i16) -> messages::ApiVersionsResponse {
@@ -53,10 +72,11 @@ pub fn decode(mut frame: Bytes) -> Result<(Header, Request)> {
         (8..=MAX_FRAME).contains(&frame.len()),
         "invalid request frame length"
     );
-    let header = Header {
+    let mut header = Header {
         key: frame.get_i16(),
         version: frame.get_i16(),
         correlation: frame.get_i32(),
+        client_id: String::new(),
     };
     let version = header.version;
     let Some(&(_, min, max)) = API_RANGES.iter().find(|r| r.0 == header.key) else {
@@ -75,7 +95,10 @@ pub fn decode(mut frame: Bytes) -> Result<(Header, Request)> {
     };
     let client_id = cursor.take(2)?.try_into().map(i16::from_be_bytes).unwrap();
     ensure!(client_id >= -1, "invalid client ID length");
-    cursor.take(client_id.max(0) as usize)?;
+    let client = std::str::from_utf8(cursor.take(client_id.max(0) as usize)?)?;
+    if client.len() <= 256 {
+        header.client_id = client.to_owned();
+    }
     if header.key != 18 || version >= 3 {
         cursor.tags()?;
     }
@@ -97,6 +120,19 @@ pub fn decode(mut frame: Bytes) -> Result<(Header, Request)> {
         1 => Request::Fetch(messages::FetchRequest::decode(&mut frame, version)?),
         2 => Request::ListOffsets(messages::ListOffsetsRequest::decode(&mut frame, version)?),
         3 => Request::Metadata(messages::MetadataRequest::decode(&mut frame, version)?),
+        8 => Request::OffsetCommit(messages::OffsetCommitRequest::decode(&mut frame, version)?),
+        9 => Request::OffsetFetch(messages::OffsetFetchRequest::decode(&mut frame, version)?),
+        10 => Request::FindCoordinator(messages::FindCoordinatorRequest::decode(
+            &mut frame, version,
+        )?),
+        11 => Request::JoinGroup(messages::JoinGroupRequest::decode(&mut frame, version)?),
+        12 => Request::Heartbeat(messages::HeartbeatRequest::decode(&mut frame, version)?),
+        13 => Request::LeaveGroup(messages::LeaveGroupRequest::decode(&mut frame, version)?),
+        14 => Request::SyncGroup(messages::SyncGroupRequest::decode(&mut frame, version)?),
+        15 => Request::DescribeGroups(messages::DescribeGroupsRequest::decode(
+            &mut frame, version,
+        )?),
+        16 => Request::ListGroups(messages::ListGroupsRequest::decode(&mut frame, version)?),
         18 => Request::ApiVersions(messages::ApiVersionsRequest::decode(&mut frame, version)?),
         19 => Request::CreateTopics(messages::CreateTopicsRequest::decode(&mut frame, version)?),
         22 => Request::InitProducerId(messages::InitProducerIdRequest::decode(
@@ -200,6 +236,22 @@ impl<'a> Guard<'a> {
         Ok(())
     }
 
+    fn compact_many(&mut self, count: usize) -> Result<()> {
+        for _ in 0..count {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
+    fn offset_fetch_topic(&mut self) -> Result<()> {
+        self.compact()?;
+        self.array(|partition| {
+            partition.take(4)?;
+            Ok(())
+        })?;
+        self.tags()
+    }
+
     fn body(&mut self, key: i16, version: i16) -> Result<()> {
         match key {
             0 => {
@@ -263,6 +315,93 @@ impl<'a> Guard<'a> {
                     topic.tags()
                 })?;
                 self.take(if version <= 10 { 3 } else { 2 })?;
+            }
+            8 => {
+                self.compact()?;
+                self.take(4)?;
+                self.compact_many(2)?;
+                self.array(|topic| {
+                    topic.compact()?;
+                    topic.array(|partition| {
+                        partition.take(16)?;
+                        partition.compact()?;
+                        partition.tags()
+                    })?;
+                    topic.tags()
+                })?;
+            }
+            9 => {
+                if version <= 7 {
+                    self.compact()?;
+                    self.array(Self::offset_fetch_topic)?;
+                } else {
+                    self.array(|group| {
+                        group.compact()?;
+                        if version >= 9 {
+                            group.compact()?;
+                            group.take(4)?;
+                        }
+                        group.array(Self::offset_fetch_topic)?;
+                        group.tags()
+                    })?;
+                }
+                if version >= 7 {
+                    self.take(1)?;
+                }
+            }
+            10 => {
+                if version == 3 {
+                    self.compact()?;
+                }
+                self.take(1)?;
+                if version >= 4 {
+                    self.array(Self::compact)?;
+                }
+            }
+            11 => {
+                self.compact()?;
+                self.take(8)?;
+                self.compact_many(3)?;
+                self.array(|protocol| {
+                    protocol.compact_many(2)?;
+                    protocol.tags()
+                })?;
+                if version >= 8 {
+                    self.compact()?;
+                }
+            }
+            12 | 14 => {
+                self.compact()?;
+                self.take(4)?;
+                self.compact_many(2)?;
+                if key == 14 {
+                    if version >= 5 {
+                        self.compact_many(2)?;
+                    }
+                    self.array(|member| {
+                        member.compact_many(2)?;
+                        member.tags()
+                    })?;
+                }
+            }
+            13 => {
+                self.compact()?;
+                self.array(|member| {
+                    member.compact_many(if version >= 5 { 3 } else { 2 })?;
+                    member.tags()
+                })?;
+            }
+            15 => {
+                self.array(Self::compact)?;
+                self.take(1)?;
+            }
+            16 => {
+                if version >= 4 {
+                    self.array(Self::compact)?;
+                }
+                if version >= 5 {
+                    self.array(Self::compact)?;
+                }
             }
             18 if version < 3 => return Ok(()),
             18 => {
@@ -335,6 +474,15 @@ mod tests {
                     1 => check(key, v, messages::FetchRequest::default()),
                     2 => check(key, v, messages::ListOffsetsRequest::default()),
                     3 => check(key, v, messages::MetadataRequest::default()),
+                    8 => check(key, v, messages::OffsetCommitRequest::default()),
+                    9 => check(key, v, messages::OffsetFetchRequest::default()),
+                    10 => check(key, v, messages::FindCoordinatorRequest::default()),
+                    11 => check(key, v, messages::JoinGroupRequest::default()),
+                    12 => check(key, v, messages::HeartbeatRequest::default()),
+                    13 => check(key, v, messages::LeaveGroupRequest::default()),
+                    14 => check(key, v, messages::SyncGroupRequest::default()),
+                    15 => check(key, v, messages::DescribeGroupsRequest::default()),
+                    16 => check(key, v, messages::ListGroupsRequest::default()),
                     18 => check(key, v, messages::ApiVersionsRequest::default()),
                     19 => check(key, v, messages::CreateTopicsRequest::default()),
                     22 => check(key, v, messages::InitProducerIdRequest::default()),

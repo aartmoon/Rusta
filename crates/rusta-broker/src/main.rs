@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
 mod catalog;
+mod cluster;
+mod group_protocol;
+mod groups;
 mod partition;
 mod protocol;
 
@@ -27,7 +30,8 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 struct Server {
-    catalog: Mutex<Catalog>,
+    catalog: Option<Mutex<Catalog>>,
+    cluster: Option<Arc<cluster::Cluster>>,
     connections: Arc<Semaphore>,
     requests: Semaphore,
     fetch_waiters: Semaphore,
@@ -46,6 +50,8 @@ impl Server {
             let _permit = permit;
             let mut catalog = state
                 .catalog
+                .as_ref()
+                .context("singleton catalog requested in cluster mode")?
                 .lock()
                 .map_err(|_| anyhow::anyhow!("broker state lock failed"))?;
             work(&mut catalog)
@@ -56,7 +62,8 @@ impl Server {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
+    let command = std::env::args().nth(1);
+    if command.as_deref() == Some("healthcheck") {
         let addr = std::env::var("RUSTA_BIND")
             .unwrap_or_else(|_| "0.0.0.0:9092".into())
             .parse::<SocketAddr>()?;
@@ -64,6 +71,13 @@ async fn main() -> Result<()> {
     }
 
     let path = std::env::var_os("RUSTA_DATA").map_or_else(|| PathBuf::from("data"), PathBuf::from);
+    if command.as_deref() == Some("decommission") {
+        cluster::request_decommission(&path)?;
+        println!(
+            "Decommission requested. Keep the broker running until it leaves cluster metadata."
+        );
+        return Ok(());
+    }
     let host = Listener::from_env(
         "RUSTA_BIND",
         "RUSTA_ADVERTISED",
@@ -71,18 +85,41 @@ async fn main() -> Result<()> {
     )?;
     let host = host.context("missing host listener")?;
     let internal = Listener::from_env("RUSTA_INTERNAL_BIND", "RUSTA_INTERNAL_ADVERTISED", None)?;
-    let catalog = Catalog::open(&path).with_context(|| format!("recover {}", path.display()))?;
+    std::fs::create_dir_all(&path)?;
+    let mode_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.join("mode-lock"))?;
+    mode_lock.try_lock().map_err(std::io::Error::from)?;
+    let (catalog, cluster) = match cluster::Settings::from_env()? {
+        Some(settings) => (None, Some(cluster::Cluster::start(settings, &path).await?)),
+        None => {
+            ensure!(
+                !path.join("cluster-identity").exists(),
+                "cluster volume cannot be opened as a singleton"
+            );
+            (
+                Some(Mutex::new(
+                    Catalog::open(&path).with_context(|| format!("recover {}", path.display()))?,
+                )),
+                None,
+            )
+        }
+    };
     let state = Arc::new(Server {
-        catalog: Mutex::new(catalog),
+        catalog,
+        cluster,
         connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
         requests: Semaphore::new(IN_FLIGHT_REQUESTS),
         fetch_waiters: Semaphore::new(WAITING_FETCHES),
         worker: Arc::new(Semaphore::new(1)),
         data_available: Notify::new(),
     });
-    let listener = host.bind().await?;
+    let listener = host.bind(false).await?;
     let internal_listener = match internal {
-        Some(internal) => Some(internal.bind().await?),
+        Some(internal) => Some(internal.bind(true).await?),
         None => None,
     };
 
@@ -109,6 +146,9 @@ async fn main() -> Result<()> {
         result = stop => result,
     };
     result?;
+    if worker.cluster.is_some() {
+        return Ok(());
+    }
     worker
         .work(|catalog| {
             catalog.maintenance(false);
@@ -118,6 +158,9 @@ async fn main() -> Result<()> {
 }
 
 async fn maintenance(state: Arc<Server>) -> Result<()> {
+    if state.cluster.is_some() {
+        return std::future::pending().await;
+    }
     let mut interval = tokio::time::interval(Duration::from_millis(100));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_retention = Instant::now();
@@ -174,7 +217,7 @@ impl Listener {
         }
     }
 
-    async fn bind(self) -> Result<(TcpListener, Endpoint)> {
+    async fn bind(self, internal: bool) -> Result<(TcpListener, Endpoint, bool)> {
         let listener = TcpListener::bind(self.bind).await?;
         eprintln!(
             "Kafka listener {} advertises {}:{}",
@@ -182,11 +225,14 @@ impl Listener {
             self.endpoint.host.as_str(),
             self.endpoint.port
         );
-        Ok((listener, self.endpoint))
+        Ok((listener, self.endpoint, internal))
     }
 }
 
-async fn accept((listener, endpoint): (TcpListener, Endpoint), state: Arc<Server>) -> Result<()> {
+async fn accept(
+    (listener, endpoint, internal): (TcpListener, Endpoint, bool),
+    state: Arc<Server>,
+) -> Result<()> {
     loop {
         let (socket, _) = listener.accept().await?;
         let Ok(permit) = state.connections.clone().try_acquire_owned() else {
@@ -196,7 +242,7 @@ async fn accept((listener, endpoint): (TcpListener, Endpoint), state: Arc<Server
         let endpoint = endpoint.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(error) = connection(socket, &endpoint, state).await {
+            if let Err(error) = connection(socket, &endpoint, internal, state).await {
                 // Unexpected protocol messages and connection resets are scoped to the client.
                 if std::env::var("RUSTA_DEBUG_CONNECTIONS").as_deref() == Ok("1") {
                     eprintln!("Kafka connection closed: {error:#}");
@@ -206,7 +252,12 @@ async fn accept((listener, endpoint): (TcpListener, Endpoint), state: Arc<Server
     }
 }
 
-async fn connection(mut socket: TcpStream, endpoint: &Endpoint, state: Arc<Server>) -> Result<()> {
+async fn connection(
+    mut socket: TcpStream,
+    endpoint: &Endpoint,
+    internal: bool,
+    state: Arc<Server>,
+) -> Result<()> {
     socket.set_nodelay(true)?;
     loop {
         let size = timeout(IDLE_TIMEOUT, socket.read_i32()).await??;
@@ -214,42 +265,73 @@ async fn connection(mut socket: TcpStream, endpoint: &Endpoint, state: Arc<Serve
             (8..=MAX_FRAME as i32).contains(&size),
             "invalid Kafka frame length"
         );
-        let _request_slot = timeout(IO_TIMEOUT, state.requests.acquire()).await??;
+        let mut request_slot = Some(timeout(IO_TIMEOUT, state.requests.acquire()).await??);
         let mut frame = vec![0; size as usize];
         timeout(IO_TIMEOUT, socket.read_exact(&mut frame)).await??;
         let (head, request) = decode(frame.into())?;
+        if let Some(cluster) = &state.cluster {
+            if let Some(response) =
+                timeout(IO_TIMEOUT, cluster.request(&head, request, internal)).await??
+            {
+                timeout(IO_TIMEOUT, socket.write_all(&response)).await??;
+            }
+            continue;
+        }
 
-        let response = if let Request::Fetch(request) = request {
-            let version = head.version;
-            let deadline =
-                Instant::now() + Duration::from_millis(request.max_wait_ms.clamp(0, 2_000) as u64);
-            let min = request.min_bytes.clamp(0, 4 * 1024 * 1024) as usize;
-            let request = Arc::new(request);
-            let wait_slot = state.fetch_waiters.try_acquire().ok();
-            loop {
-                let notified = state.data_available.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                let request = request.clone();
-                let (response, bytes, error) = state
-                    .work(move |catalog| Ok(catalog.fetch(&request, version)))
+        let response = match request {
+            Request::JoinGroup(request) => {
+                let host = socket.peer_addr()?.ip().to_string();
+                let client = head.client_id.clone();
+                let completion = state
+                    .work(move |catalog| Ok(catalog.groups.join(request, client, host)))
                     .await?;
-                if error || bytes >= min || wait_slot.is_none() || Instant::now() >= deadline {
-                    break Some(encode(&head, version, &response)?);
+                drop(request_slot.take());
+                let mut response = completion.await?;
+                if head.version == 6 && response.protocol_name.is_none() {
+                    response.protocol_name = Some(StrBytes::default());
                 }
-                drop(response);
-                let _ = timeout_at(deadline, notified).await;
+                Some(encode(&head, head.version, &response)?)
             }
-        } else {
-            let notify = matches!(request, Request::Produce(_));
-            let endpoint = endpoint.clone();
-            let result = state
-                .work(move |catalog| catalog.request(&head, request, &endpoint))
-                .await?;
-            if notify {
-                state.data_available.notify_waiters();
+            Request::SyncGroup(request) => {
+                let completion = state
+                    .work(move |catalog| Ok(catalog.groups.sync(request)))
+                    .await?;
+                drop(request_slot.take());
+                Some(encode(&head, head.version, &completion.await?)?)
             }
-            result
+            Request::Fetch(request) => {
+                let version = head.version;
+                let deadline = Instant::now()
+                    + Duration::from_millis(request.max_wait_ms.clamp(0, 2_000) as u64);
+                let min = request.min_bytes.clamp(0, 4 * 1024 * 1024) as usize;
+                let request = Arc::new(request);
+                let wait_slot = state.fetch_waiters.try_acquire().ok();
+                loop {
+                    let notified = state.data_available.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    let request = request.clone();
+                    let (response, bytes, error) = state
+                        .work(move |catalog| Ok(catalog.fetch(&request, version)))
+                        .await?;
+                    if error || bytes >= min || wait_slot.is_none() || Instant::now() >= deadline {
+                        break Some(encode(&head, version, &response)?);
+                    }
+                    drop(response);
+                    let _ = timeout_at(deadline, notified).await;
+                }
+            }
+            request => {
+                let notify = matches!(request, Request::Produce(_));
+                let endpoint = endpoint.clone();
+                let result = state
+                    .work(move |catalog| catalog.request(&head, request, &endpoint))
+                    .await?;
+                if notify {
+                    state.data_available.notify_waiters();
+                }
+                result
+            }
         };
         if let Some(response) = response {
             timeout(IO_TIMEOUT, socket.write_all(&response)).await??;

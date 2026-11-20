@@ -7,6 +7,7 @@ use rusta_log::{Options, PartitionLog};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::groups::Groups;
 use crate::partition::Partition;
 
 pub const MAX_PARTITIONS: usize = 512;
@@ -31,6 +32,7 @@ pub struct Topic {
 }
 
 pub struct Catalog {
+    pub groups: Groups,
     pub topics: BTreeMap<String, Topic>,
     pub names_by_id: HashMap<Uuid, String>,
     pub cluster_id: Uuid,
@@ -109,6 +111,7 @@ impl Catalog {
             }
         };
         Ok(Self {
+            groups: Groups::open(&root.join("groups"))?,
             topics,
             names_by_id,
             cluster_id,
@@ -150,6 +153,7 @@ impl Catalog {
     }
 
     pub fn maintenance(&mut self, retention: bool) -> bool {
+        self.groups.maintain(retention);
         let mut committed = false;
         for topic in self.topics.values_mut() {
             for partition in &mut topic.partitions {

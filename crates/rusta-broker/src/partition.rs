@@ -15,7 +15,7 @@ use crate::catalog::{DEFAULT_RETENTION_MS, TopicConfig};
 use crate::protocol::Error;
 
 pub const MAX_BATCH: usize = 1024 * 1024;
-const MAX_PRODUCER_STATES: usize = 256;
+pub const MAX_PRODUCER_STATES: usize = 256;
 const MAX_CHECKPOINT_BYTES: u64 = 512 * 1024;
 const PRODUCER_CHECKPOINT: &str = "producer-state.json";
 
@@ -35,13 +35,13 @@ struct Written {
 }
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize)]
-struct History {
+pub struct History {
     recent: [Option<Written>; 5],
-    next_sequence: i32,
+    pub next_sequence: i32,
 }
 
 impl History {
-    fn find(&self, batch: Batch) -> Option<i64> {
+    pub fn find(&self, batch: Batch) -> Option<i64> {
         self.recent
             .iter()
             .flatten()
@@ -53,7 +53,7 @@ impl History {
             .map(|written| written.offset)
     }
 
-    fn add(&mut self, batch: Batch, offset: i64) {
+    pub fn add(&mut self, batch: Batch, offset: i64) {
         self.recent.rotate_right(1);
         self.recent[0] = Some(Written {
             sequence: batch.sequence,

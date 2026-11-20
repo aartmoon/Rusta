@@ -17,7 +17,7 @@ trap cleanup EXIT
 
 mvn -B -q -f tests/java/pom.xml org.apache.maven.plugins:maven-dependency-plugin:3.8.1:copy-dependencies \
     "-DoutputDirectory=$scratch/deps"
-javac -cp "$scratch/deps/*" -d "$scratch" tests/java/Smoke.java
+javac -cp "$scratch/deps/*" -d "$scratch" tests/java/Smoke.java tests/java/GroupSmoke.java tests/java/SpringSmoke.java
 
 "${compose[@]}" up -d --wait --build
 broker="$("${compose[@]}" ps -q broker)"
@@ -25,10 +25,18 @@ docker exec "$broker" sh -c 'awk "/^(VmRSS|VmHWM):/" /proc/1/status; wc -c /usr/
 java -Dorg.slf4j.simpleLogger.defaultLogLevel=warn -cp "$scratch:$scratch/deps/*" \
     Smoke write "127.0.0.1:$RUSTA_PORT" "$scratch/identity"
 
+for test_class in GroupSmoke SpringSmoke; do
+    java -Dorg.slf4j.simpleLogger.defaultLogLevel=warn -cp "$scratch:$scratch/deps/*" \
+        "$test_class" write "127.0.0.1:$RUSTA_PORT"
+done
 "${compose[@]}" kill -s SIGKILL broker
 "${compose[@]}" up -d --wait --force-recreate
 java -Dorg.slf4j.simpleLogger.defaultLogLevel=warn -cp "$scratch:$scratch/deps/*" \
     Smoke verify "127.0.0.1:$RUSTA_PORT" "$scratch/identity"
+for test_class in GroupSmoke SpringSmoke; do
+    java -Dorg.slf4j.simpleLogger.defaultLogLevel=warn -cp "$scratch:$scratch/deps/*" \
+        "$test_class" verify "127.0.0.1:$RUSTA_PORT"
+done
 docker run --rm --network "${project}_default" --mount "type=bind,src=$scratch,dst=/smoke,readonly" \
     eclipse-temurin:21-jdk-noble java -Dorg.slf4j.simpleLogger.defaultLogLevel=warn \
     -cp '/smoke:/smoke/deps/*' Smoke internal broker:29092

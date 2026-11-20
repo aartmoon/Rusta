@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::catalog::{Catalog, DEFAULT_RETENTION_MS, MAX_PARTITIONS, Topic, TopicConfig};
 use crate::partition::MAX_BATCH;
 
-const BROKER: BrokerId = BrokerId(1);
+pub const BROKER: BrokerId = BrokerId(1);
 const FETCH_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug)]
@@ -20,23 +20,39 @@ pub enum Error {
     OffsetOutOfRange = 1,
     CorruptMessage = 2,
     UnknownTopic = 3,
+    LeaderUnavailable = 5,
+    NotLeader = 6,
+    RequestTimedOut = 7,
     MessageTooLarge = 10,
+    OffsetMetadataTooLarge = 12,
+    CoordinatorNotAvailable = 15,
     InvalidRequiredAcks = 21,
+    IllegalGeneration = 22,
+    InconsistentGroupProtocol = 23,
+    InvalidGroupId = 24,
+    UnknownMember = 25,
+    InvalidSessionTimeout = 26,
+    RebalanceInProgress = 27,
     UnsupportedVersion = 35,
     TopicExists = 36,
     InvalidPartitions = 37,
     InvalidReplicationFactor = 38,
     InvalidAssignment = 39,
     InvalidConfig = 40,
+    NotController = 41,
     InvalidRequest = 42,
     PolicyViolation = 44,
     OutOfOrderSequence = 45,
     InvalidProducerEpoch = 47,
     Storage = 56,
     UnknownProducerId = 59,
+    GroupIdNotFound = 69,
     FetchSessionNotFound = 70,
+    FencedLeaderEpoch = 74,
     UnknownLeaderEpoch = 75,
     UnsupportedCompression = 76,
+    MemberIdRequired = 79,
+    GroupMaxSizeReached = 81,
     InvalidRecord = 87,
     UnknownTopicId = 100,
     InvalidTopicName = 17,
@@ -67,6 +83,18 @@ impl Catalog {
             Request::ApiVersions(_) => encode(head, v, &api_versions(0))?,
             Request::UnsupportedApiVersions => {
                 encode(head, 0, &api_versions(Error::UnsupportedVersion as i16))?
+            }
+            Request::FindCoordinator(request) => {
+                encode(head, v, &Self::find_coordinator(request, v, endpoint))?
+            }
+            Request::Heartbeat(request) => encode(head, v, &self.heartbeat(request))?,
+            Request::LeaveGroup(request) => encode(head, v, &self.leave_group(request))?,
+            Request::OffsetCommit(request) => encode(head, v, &self.offset_commit(request))?,
+            Request::OffsetFetch(request) => encode(head, v, &self.offset_fetch(request, v))?,
+            Request::DescribeGroups(request) => encode(head, v, &self.describe_groups(request, v))?,
+            Request::ListGroups(request) => encode(head, v, &self.list_groups(request))?,
+            Request::JoinGroup(_) | Request::SyncGroup(_) => {
+                anyhow::bail!("group request must run through its completion channel")
             }
             Request::Metadata(request) => encode(head, v, &self.metadata(request, endpoint))?,
             Request::CreateTopics(request) => encode(head, v, &self.create_topics(request))?,
@@ -435,7 +463,7 @@ impl Catalog {
                                 .partitions
                                 .get(part.partition_index as usize)
                                 .ok_or(Error::UnknownTopic)?;
-                            lookup(partition, part.timestamp)
+                            lookup(&partition.log, part.timestamp)
                         })();
                         match result {
                             Ok(Some((offset, timestamp))) => {
@@ -525,7 +553,7 @@ fn metadata_topic(topic: &Topic) -> messages::metadata_response::MetadataRespons
         .with_partitions(partitions)
 }
 
-fn topic_config(
+pub fn topic_config(
     topic: &messages::create_topics_request::CreatableTopic,
     remaining: usize,
 ) -> Result<TopicConfig, Error> {
@@ -604,11 +632,7 @@ fn topic_config(
     })
 }
 
-fn lookup(
-    partition: &crate::partition::Partition,
-    timestamp: i64,
-) -> Result<Option<(i64, i64)>, Error> {
-    let log = &partition.log;
+pub fn lookup(log: &rusta_log::PartitionLog, timestamp: i64) -> Result<Option<(i64, i64)>, Error> {
     let start = log.start().next_offset;
     match timestamp {
         -2 => Ok(Some((start, -1))),

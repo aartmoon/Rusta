@@ -1,0 +1,77 @@
+x-broker: &broker
+  build: .
+  image: rusta:local
+  cpus: 1.0
+  mem_limit: 512m
+  healthcheck:
+    test: [CMD, /usr/local/bin/rusta, healthcheck]
+    interval: 2s
+    timeout: 4s
+    retries: 10
+
+x-cluster-env: &cluster-env
+  RUSTA_CLUSTER_ID: ${RUSTA_CLUSTER_ID:-4e90dcf1-72c1-491e-99a1-72d58be78c35}
+  RUSTA_CLUSTER_PEERS: "1,raft1:7000,127.0.0.1:${RUSTA_PORT_1:-19092},broker1:29092;2,raft2:7000,127.0.0.1:${RUSTA_PORT_2:-19093},broker2:29092;3,raft3:7000,127.0.0.1:${RUSTA_PORT_3:-19094},broker3:29092"
+  RUSTA_CLUSTER_CERTS: /etc/rusta/pki
+  RUSTA_INTERNAL_BIND: 0.0.0.0:29092
+  RUSTA_DEBUG_CONNECTIONS: "${RUSTA_DEBUG_CONNECTIONS:-0}"
+
+services:
+  broker1:
+    <<: *broker
+    environment:
+      <<: *cluster-env
+      RUSTA_NODE_ID: "1"
+      RUSTA_ADVERTISED: 127.0.0.1:${RUSTA_PORT_1:-19092}
+      RUSTA_INTERNAL_ADVERTISED: broker1:29092
+    ports: ["127.0.0.1:${RUSTA_PORT_1:-19092}:9092"]
+    networks:
+      default:
+        gw_priority: 1
+      raft:
+        aliases: [raft1]
+    volumes:
+      - data1:/var/lib/rusta
+      - ${RUSTA_CLUSTER_PKI:?generate cluster certificates}/public:/etc/rusta/pki:ro
+      - ${RUSTA_CLUSTER_PKI}/node-1.key:/etc/rusta/pki/key.pem:ro
+  broker2:
+    <<: *broker
+    environment:
+      <<: *cluster-env
+      RUSTA_NODE_ID: "2"
+      RUSTA_ADVERTISED: 127.0.0.1:${RUSTA_PORT_2:-19093}
+      RUSTA_INTERNAL_ADVERTISED: broker2:29092
+    ports: ["127.0.0.1:${RUSTA_PORT_2:-19093}:9092"]
+    networks:
+      default:
+        gw_priority: 1
+      raft:
+        aliases: [raft2]
+    volumes:
+      - data2:/var/lib/rusta
+      - ${RUSTA_CLUSTER_PKI}/public:/etc/rusta/pki:ro
+      - ${RUSTA_CLUSTER_PKI}/node-2.key:/etc/rusta/pki/key.pem:ro
+  broker3:
+    <<: *broker
+    environment:
+      <<: *cluster-env
+      RUSTA_NODE_ID: "3"
+      RUSTA_ADVERTISED: 127.0.0.1:${RUSTA_PORT_3:-19094}
+      RUSTA_INTERNAL_ADVERTISED: broker3:29092
+    ports: ["127.0.0.1:${RUSTA_PORT_3:-19094}:9092"]
+    networks:
+      default:
+        gw_priority: 1
+      raft:
+        aliases: [raft3]
+    volumes:
+      - data3:/var/lib/rusta
+      - ${RUSTA_CLUSTER_PKI}/public:/etc/rusta/pki:ro
+      - ${RUSTA_CLUSTER_PKI}/node-3.key:/etc/rusta/pki/key.pem:ro
+volumes:
+  data1:
+  data2:
+  data3:
+networks:
+  raft:
+    internal: true

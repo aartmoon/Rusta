@@ -189,7 +189,7 @@ public final class Smoke {
         return result.baseOffset();
     }
 
-    private static AbstractResponse exchange(String endpoint, AbstractRequest request, int correlation) throws Exception {
+    static AbstractResponse exchange(String endpoint, AbstractRequest request, int correlation) throws Exception {
         var parts = endpoint.split(":");
         var header = new RequestHeader(request.apiKey(), request.version(), "rusta-smoke", correlation);
         var body = request.serializeWithHeader(header);

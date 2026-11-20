@@ -1,3 +1,5 @@
 /target/
 /data/
 /tests/java/target/
+
+/.rusta-cluster-pki/
