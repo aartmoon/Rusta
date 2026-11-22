@@ -7,13 +7,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use protobuf::Message as ProtoMessage;
 use raft::eraftpb::{Message, MessageType};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     runtime::Handle,
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     time::{sleep, timeout},
 };
 use tokio_rustls::{
@@ -29,7 +30,7 @@ use tokio_rustls::{
 use uuid::Uuid;
 
 use super::{
-    Cluster, Peer, Settings,
+    Cluster, Peer, Settings, ack_profile,
     engine::{GroupId, Movement},
 };
 
@@ -47,6 +48,7 @@ pub enum Packet {
 pub struct Queued {
     packet: Packet,
     _bytes: OwnedSemaphorePermit,
+    enqueued_at: Option<std::time::Instant>,
 }
 
 impl Queued {
@@ -70,20 +72,61 @@ impl Queued {
         } else {
             MAX_PACKET
         };
-        if size <= limit
-            && let Ok(permit) = budget.clone().try_acquire_many_owned(size as u32)
-        {
-            let _ = queue.try_send(Self {
-                packet,
-                _bytes: permit,
-            });
+        let bulk = matches!(&packet, Packet::Raft(key, message) if !key.topic.is_nil() && (
+            message.get_msg_type() == MessageType::MsgSnapshot ||
+            message.get_msg_type() == MessageType::MsgAppend && !message.entries.is_empty()
+        ));
+        if size > limit {
+            record_drop("raft_oversized_frame");
+            return;
         }
+        if bulk && queue.capacity() <= (queue.max_capacity() / 8).min(32) {
+            record_drop("raft_control_slots_reserved");
+            return;
+        }
+        let reserve = if bulk { 128 * 1024 } else { 0 };
+        let Ok(mut permit) = budget.clone().try_acquire_many_owned(size as u32 + reserve) else {
+            record_drop("raft_byte_budget_exhausted");
+            return;
+        };
+        if reserve != 0 {
+            drop(
+                permit
+                    .split(reserve as usize)
+                    .expect("reserved Raft control bytes"),
+            );
+        }
+        let sent = queue.try_send(Self {
+            packet,
+            _bytes: permit,
+            enqueued_at: ack_profile::start(),
+        });
+        if let Err(mpsc::error::TrySendError::Full(queued)) = sent {
+            let stage = match queued.packet {
+                Packet::Raft(key, message) if !key.topic.is_nil() => match message.get_msg_type() {
+                    MessageType::MsgAppend if !message.entries.is_empty() => "raft_dropped_append",
+                    MessageType::MsgAppendResponse => "raft_dropped_append_response",
+                    _ => "raft_dropped_other",
+                },
+                _ => "raft_dropped_other",
+            };
+            record_drop(stage);
+        }
+    }
+}
+
+fn record_drop(stage: &'static str) {
+    if ack_profile::enabled() {
+        ack_profile::record(stage, Duration::ZERO);
     }
 }
 
 pub type Senders = HashMap<u64, mpsc::Sender<Queued>>;
 type Pins = HashMap<u64, CertificateDer<'static>>;
 const MAX_PACKET: usize = 2 * 1024 * 1024 + 65536;
+// One timer turn can enqueue a heartbeat for each partition plus internal groups.
+// The shared byte budget still limits retention of large frames.
+const RAFT_SEND_QUEUE_SLOTS: usize = crate::catalog::MAX_PARTITIONS + 32;
 const HEADER: usize = 49;
 const GROUP: usize = 20;
 const LEGACY_MOVE: usize = GROUP + 16;
@@ -278,7 +321,7 @@ impl Routes {
         pinned: CertificateDer<'static>,
         runtime: &Handle,
     ) -> mpsc::Sender<Queued> {
-        let (sender, messages) = mpsc::channel(16);
+        let (sender, messages) = mpsc::channel(RAFT_SEND_QUEUE_SLOTS);
         runtime.spawn(outbound(
             self.cluster,
             self.voter_mask,
@@ -401,6 +444,7 @@ async fn outbound(
     let snapshots = Arc::new(Semaphore::new(1));
     let mut socket = None;
     while let Some(queued) = messages.recv().await {
+        ack_profile::finish("raft_outbound_queue", queued.enqueued_at);
         if matches!(&queued.packet, Packet::Raft(_, message) if message.get_msg_type() == MessageType::MsgSnapshot)
         {
             if let Ok(slot) = snapshots.clone().try_acquire_owned() {
@@ -467,6 +511,15 @@ async fn outbound(
     }
 }
 
+async fn wait_for_raft_admissions(
+    pending: &mut FuturesUnordered<oneshot::Receiver<Result<()>>>,
+) -> Result<()> {
+    while let Some(reply) = pending.next().await {
+        reply??;
+    }
+    Ok(())
+}
+
 async fn inbound(
     cluster: Arc<Cluster>,
     (cluster_id, voter_mask, local): (Uuid, [u8; 32], u64),
@@ -490,7 +543,14 @@ async fn inbound(
         .find(|(id, pinned)| **id != local && *pinned == leaf)
         .map(|(&id, _)| id)
         .context("unregistered node certificate")?;
+    let mut pending = FuturesUnordered::<oneshot::Receiver<Result<()>>>::new();
     loop {
+        while let Some(Some(reply)) = pending.next().now_or_never() {
+            reply??;
+        }
+        if pending.len() >= 16 {
+            pending.next().await.expect("full Raft pipeline")??;
+        }
         let frame = timeout(Duration::from_secs(30), socket.read_u32()).await?? as usize;
         ensure!(
             (HEADER..=MAX_SNAPSHOT_FRAME).contains(&frame),
@@ -507,7 +567,7 @@ async fn inbound(
             frame <= MAX_PACKET || kind == SNAPSHOT_FRAME,
             "invalid Raft frame size"
         );
-        let _permit = timeout(DEADLINE, bytes.acquire_many(frame as u32)).await??;
+        let permit = timeout(DEADLINE, bytes.clone().acquire_many_owned(frame as u32)).await??;
         let mut data = vec![0; frame - HEADER];
         if kind == SNAPSHOT_FRAME {
             timeout(SNAPSHOT_TIMEOUT, read_snapshot_body(&mut socket, &mut data)).await??;
@@ -515,6 +575,9 @@ async fn inbound(
             timeout(DEADLINE, socket.read_exact(&mut data)).await??;
         }
         let body = data.as_slice();
+        if kind != 2 {
+            wait_for_raft_admissions(&mut pending).await?;
+        }
         match kind {
             2 | SNAPSHOT_FRAME => {
                 ensure!(body.len() >= GROUP, "missing Raft group identity");
@@ -528,6 +591,44 @@ async fn inbound(
                     kind != SNAPSHOT_FRAME || message.get_msg_type() == MessageType::MsgSnapshot,
                     "invalid snapshot frame"
                 );
+                let stage = match message.get_msg_type() {
+                    MessageType::MsgAppend if !message.entries.is_empty() => {
+                        Some("raft_append_worker_queue")
+                    }
+                    MessageType::MsgAppendResponse => Some("raft_append_response_worker_queue"),
+                    _ => None,
+                };
+                if !cluster.page_cache
+                    && !key.topic.is_nil()
+                    && message.get_msg_type() != MessageType::MsgSnapshot
+                {
+                    let queued =
+                        stage.and_then(|stage| ack_profile::start().map(|time| (stage, time)));
+                    let packet = (message, permit, queued);
+                    let reply = cluster
+                        .executor
+                        .submit(
+                            &cluster,
+                            key,
+                            packet,
+                            |partition, (message, _permit, queued)| {
+                                if let Some((stage, time)) = queued {
+                                    ack_profile::record(stage, time.elapsed());
+                                }
+                                partition.receive(message)
+                            },
+                            move |engine, (message, _permit, queued)| {
+                                if let Some((stage, time)) = queued {
+                                    ack_profile::record(stage, time.elapsed());
+                                }
+                                engine.receive(key, message)
+                            },
+                        )
+                        .await?;
+                    pending.push(reply);
+                    continue;
+                }
+                wait_for_raft_admissions(&mut pending).await?;
                 cluster
                     .call(move |engine| engine.receive(key, message))
                     .await?;

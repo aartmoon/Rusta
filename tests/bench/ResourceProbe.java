@@ -9,6 +9,7 @@ import org.apache.kafka.clients.admin.*;
 import org.apache.kafka.clients.consumer.*;
 import org.apache.kafka.clients.producer.*;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.serialization.*;
 
 public final class ResourceProbe {
@@ -30,6 +31,20 @@ public final class ResourceProbe {
         p.put("partition.assignment.strategy", "org.apache.kafka.clients.consumer.RangeAssignor");
         return new KafkaConsumer<>(p, new ByteArrayDeserializer(), new ByteArrayDeserializer());
     }
+
+    private static String producerMetrics(KafkaProducer<byte[],byte[]> producer) {
+        var names = Set.of("record-queue-time-avg", "record-queue-time-max", "request-latency-avg",
+            "request-latency-max", "record-retry-total", "record-error-total", "records-per-request-avg");
+        var output = new StringJoiner(",", "{", "}");
+        producer.metrics().forEach((name, metric) -> {
+            if (name.group().equals("producer-metrics") && names.contains(name.name())
+                && metric.metricValue() instanceof Number number && Double.isFinite(number.doubleValue())) {
+                output.add("\"" + name.name() + "\":" + number.doubleValue());
+            }
+        });
+        return output.toString();
+    }
+
     public static void main(String[] args) throws Exception {
         String seeds = args[1];
         String topic = args[2];
@@ -53,6 +68,15 @@ public final class ResourceProbe {
                     .map(name -> new NewTopic(name, partitions, rf).configs(settings)).toList();
                 admin.createTopics(topics).all().get(30, TimeUnit.SECONDS);
                 admin.describeTopics(topics.stream().map(NewTopic::name).toList()).allTopicNames().get(30, TimeUnit.SECONDS);
+                if (settings.containsKey("write.caching")) {
+                    var resources = topics.stream().map(t -> new ConfigResource(ConfigResource.Type.TOPIC, t.name())).toList();
+                    var configs = admin.describeConfigs(resources).all().get(30, TimeUnit.SECONDS);
+                    for (var resource : resources) {
+                        var entry = configs.get(resource).get("write.caching");
+                        if (entry == null || !settings.get("write.caching").equals(entry.value()))
+                            throw new IllegalStateException("unexpected write.caching for " + resource.name() + ": " + entry);
+                    }
+                }
             }
             return;
         }
@@ -126,6 +150,7 @@ public final class ResourceProbe {
         long measuredNanos = 0;
         long readStart = 0, readEnd = 0, ackStart = 0, ackEnd = 0;
         var sentDuring = 0L;
+        String clientMetrics;
         try (var p = new KafkaProducer<>(properties, new ByteArraySerializer(), new ByteArraySerializer())) {
             for (int slot = 0; slot < (duration + 4) * 100; slot++) {
                 long remaining = start + slot * 10_000_000L - System.nanoTime();
@@ -164,6 +189,7 @@ public final class ResourceProbe {
             measuredNanos = System.nanoTime() - measuredNanos;
             Files.createFile(files.resolve("end"));
             p.flush();
+            clientMetrics = producerMetrics(p);
         } finally {
             done.set(true);
         }
@@ -180,9 +206,9 @@ public final class ResourceProbe {
             : "null";
         double seconds = measuredNanos / 1e9;
         System.out.printf(Locale.ROOT,
-            "{\"seconds\":%.3f,\"sent_total\":%d,\"acked_total\":%d,\"consumed_and_committed_total\":%d,\"offered_msg_s\":%.1f,\"acked_msg_s\":%.1f,\"consumed_msg_s\":%.1f,\"p50_ms\":%.3f,\"p95_ms\":%.3f,\"p99_ms\":%.3f,\"ack_samples\":%d,\"end_to_end_samples\":%d,\"end_to_end_p99_ms\":%s,\"submitted_unread_at_window_end\":%d}%n",
+            "{\"seconds\":%.3f,\"sent_total\":%d,\"acked_total\":%d,\"consumed_and_committed_total\":%d,\"offered_msg_s\":%.1f,\"acked_msg_s\":%.1f,\"consumed_msg_s\":%.1f,\"p50_ms\":%.3f,\"p95_ms\":%.3f,\"p99_ms\":%.3f,\"ack_samples\":%d,\"end_to_end_samples\":%d,\"end_to_end_p99_ms\":%s,\"submitted_unread_at_window_end\":%d,\"producer_metrics\":%s}%n",
             seconds, sent.get(), acks.get(), committed.get(), sentDuring / seconds, (ackEnd - ackStart) / seconds, (readEnd - readStart) / seconds,
             lat[(int)(lat.length * .50)] / 1e6, lat[(int)(lat.length * .95)] / 1e6, lat[(int)(lat.length * .99)] / 1e6,
-            lat.length, e2e.length, e2eP99, read ? sent.get() - readEnd : 0L);
+            lat.length, e2e.length, e2eP99, read ? sent.get() - readEnd : 0L, clientMetrics);
     }
 }

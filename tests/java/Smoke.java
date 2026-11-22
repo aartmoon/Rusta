@@ -205,22 +205,31 @@ public final class Smoke {
 
     static AbstractResponse exchange(String endpoint, AbstractRequest request, int correlation) throws Exception {
         var parts = endpoint.split(":");
+        try (var socket = new Socket(parts[0], Integer.parseInt(parts[1]))) {
+            socket.setSoTimeout(5000);
+            var header = writeRequest(new DataOutputStream(socket.getOutputStream()), request, correlation);
+            return readResponse(new DataInputStream(socket.getInputStream()), header);
+        }
+    }
+
+    static RequestHeader writeRequest(DataOutputStream output, AbstractRequest request, int correlation) throws Exception {
         var header = new RequestHeader(request.apiKey(), request.version(), "rusta-smoke", correlation);
         var body = request.serializeWithHeader(header);
         byte[] requestBytes = new byte[body.remaining()];
         body.get(requestBytes);
-        try (var socket = new Socket(parts[0], Integer.parseInt(parts[1]))) {
-            socket.setSoTimeout(5000);
-            var output = new DataOutputStream(socket.getOutputStream());
-            output.writeInt(requestBytes.length);
-            output.write(requestBytes);
-            var input = new DataInputStream(socket.getInputStream());
-            int size = input.readInt();
-            check(size > 0 && size < 8 * 1024 * 1024, "invalid response length");
-            byte[] response = new byte[size];
-            input.readFully(response);
-            return AbstractResponse.parseResponse(ByteBuffer.wrap(response), header);
-        }
+        output.writeInt(requestBytes.length);
+        output.write(requestBytes);
+        return header;
+    }
+
+    static AbstractResponse readResponse(DataInputStream input, RequestHeader header) throws Exception {
+        int size = input.readInt();
+        check(size >= 4 && size < 8 * 1024 * 1024, "invalid response length");
+        byte[] response = new byte[size];
+        input.readFully(response);
+        var bytes = ByteBuffer.wrap(response);
+        check(bytes.getInt(0) == header.correlationId(), "out-of-order response correlation");
+        return AbstractResponse.parseResponse(bytes, header);
     }
 
     private static String value(String codec, int index) {

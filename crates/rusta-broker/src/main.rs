@@ -15,10 +15,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
-use rusta_kafka::{MAX_FRAME, Request, decode, encode, protocol::StrBytes};
+use rusta_kafka::{Header, MAX_FRAME, Request, decode, encode, protocol::StrBytes};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{Notify, Semaphore, SemaphorePermit, mpsc, oneshot};
 use tokio::time::{Instant, timeout, timeout_at};
 
 use crate::catalog::Catalog;
@@ -26,6 +26,9 @@ use crate::protocol::Endpoint;
 
 const MAX_CONNECTIONS: usize = 128;
 const IN_FLIGHT_REQUESTS: usize = 6;
+const CLUSTER_IN_FLIGHT_REQUESTS: usize = 16;
+const CLUSTER_REQUEST_BYTES: usize = IN_FLIGHT_REQUESTS * MAX_FRAME;
+const QUEUED_PRODUCE_REPLIES: usize = 3;
 const WAITING_FETCHES: usize = 3;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -35,6 +38,7 @@ struct Server {
     cluster: Option<Arc<cluster::Cluster>>,
     connections: Arc<Semaphore>,
     requests: Semaphore,
+    request_bytes: Semaphore,
     fetch_waiters: Semaphore,
     worker: Arc<Semaphore>,
     data_available: Notify,
@@ -162,11 +166,17 @@ async fn main() -> Result<()> {
             )
         }
     };
+    let in_flight = if cluster.is_some() {
+        CLUSTER_IN_FLIGHT_REQUESTS
+    } else {
+        IN_FLIGHT_REQUESTS
+    };
     let state = Arc::new(Server {
         catalog,
         cluster,
         connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
-        requests: Semaphore::new(IN_FLIGHT_REQUESTS),
+        requests: Semaphore::new(in_flight),
+        request_bytes: Semaphore::new(CLUSTER_REQUEST_BYTES),
         fetch_waiters: Semaphore::new(WAITING_FETCHES),
         worker: Arc::new(Semaphore::new(1)),
         data_available: Notify::new(),
@@ -325,6 +335,17 @@ async fn connection(
 ) -> Result<()> {
     socket.set_nodelay(true)?;
     let client_host = socket.peer_addr()?.ip().to_string();
+    if let Some(cluster) = &state.cluster {
+        return cluster_connection(
+            socket,
+            cluster,
+            &state.requests,
+            &state.request_bytes,
+            internal,
+            client_host,
+        )
+        .await;
+    }
     loop {
         let size = timeout(IDLE_TIMEOUT, socket.read_i32()).await??;
         ensure!(
@@ -335,21 +356,6 @@ async fn connection(
         let mut frame = vec![0; size as usize];
         timeout(IO_TIMEOUT, socket.read_exact(&mut frame)).await??;
         let (head, request) = decode(frame.into())?;
-        if let Some(cluster) = &state.cluster {
-            let waits = matches!(request, Request::JoinGroup(_) | Request::SyncGroup(_));
-            let request = cluster.request(&head, request, internal, client_host.clone());
-            let response = if waits {
-                drop(request_slot.take());
-                request.await?
-            } else {
-                timeout(IO_TIMEOUT, request).await??
-            };
-            if let Some(response) = response {
-                timeout(IO_TIMEOUT, socket.write_all(&response)).await??;
-            }
-            continue;
-        }
-
         let response = match request {
             Request::JoinGroup(request) => {
                 let host = client_host.clone();
@@ -407,6 +413,89 @@ async fn connection(
             timeout(IO_TIMEOUT, socket.write_all(&response)).await??;
         }
     }
+}
+
+struct RequestBudget<'a> {
+    _slot: SemaphorePermit<'a>,
+    _bytes: SemaphorePermit<'a>,
+}
+
+enum ClusterResponse<'a> {
+    Produce(Header, cluster::ProduceReply, RequestBudget<'a>, Instant),
+    Other(Header, Request, RequestBudget<'a>, oneshot::Sender<()>),
+}
+
+async fn cluster_connection(
+    mut socket: TcpStream,
+    cluster: &Arc<cluster::Cluster>,
+    requests: &Semaphore,
+    request_bytes: &Semaphore,
+    internal: bool,
+    client_host: String,
+) -> Result<()> {
+    let (mut reader, mut writer) = socket.split();
+    let (send, mut receive) = mpsc::channel(QUEUED_PRODUCE_REPLIES);
+    let admit = async move {
+        loop {
+            let slot = send.reserve().await?;
+            let size = match timeout(IDLE_TIMEOUT, reader.read_i32()).await? {
+                Ok(size) => size,
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                Err(error) => return Err(error.into()),
+            };
+            ensure!(
+                (8..=MAX_FRAME as i32).contains(&size),
+                "invalid Kafka frame length"
+            );
+            let permit = RequestBudget {
+                _slot: timeout(IO_TIMEOUT, requests.acquire()).await??,
+                _bytes: timeout(IO_TIMEOUT, request_bytes.acquire_many(size as u32)).await??,
+            };
+            let mut frame = vec![0; size as usize];
+            timeout(IO_TIMEOUT, reader.read_exact(&mut frame)).await??;
+            let (head, request) = decode(frame.into())?;
+            if let Request::Produce(request) = request {
+                let deadline = Instant::now() + IO_TIMEOUT;
+                let reply = timeout_at(deadline, cluster.stage_produce(request)).await??;
+                slot.send(ClusterResponse::Produce(head, reply, permit, deadline));
+            } else {
+                // Other APIs retain their ordering with respect to Produce on this socket.
+                let (done, finished) = oneshot::channel();
+                slot.send(ClusterResponse::Other(head, request, permit, done));
+                finished.await?;
+            }
+        }
+    };
+    let respond = async move {
+        while let Some(response) = receive.recv().await {
+            match response {
+                ClusterResponse::Produce(head, reply, _permit, deadline) => {
+                    let bytes = timeout_at(deadline, reply.finish(&head)).await??;
+                    timeout(IO_TIMEOUT, writer.write_all(&bytes)).await??;
+                }
+                ClusterResponse::Other(head, request, permit, done) => {
+                    let waits = matches!(request, Request::JoinGroup(_) | Request::SyncGroup(_));
+                    let request = cluster.request(&head, request, internal, client_host.clone());
+                    let mut permit = Some(permit);
+                    let bytes = if waits {
+                        drop(permit.take());
+                        request.await?
+                    } else {
+                        timeout(IO_TIMEOUT, request).await??
+                    };
+                    if let Some(bytes) = bytes {
+                        timeout(IO_TIMEOUT, writer.write_all(&bytes)).await??;
+                    }
+                    let _ = done.send(());
+                }
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+    tokio::try_join!(admit, respond)?;
+    Ok(())
 }
 
 async fn check_health(mut address: SocketAddr) -> Result<()> {

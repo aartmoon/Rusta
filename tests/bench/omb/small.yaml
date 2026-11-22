@@ -1,0 +1,14 @@
+name: RF3 durable / 48 partitions / 1 KiB / 50k messages per second
+topics: 1
+partitionsPerTopic: 48
+messageSize: 1024
+useRandomizedPayloads: true
+randomBytesRatio: 0.5
+randomizedPayloadPoolSize: 1000
+subscriptionsPerTopic: 1
+consumerPerSubscription: 4
+producersPerTopic: 4
+producerRate: 50000
+consumerBacklogSizeGB: 0
+warmupDurationMinutes: 30
+testDurationMinutes: 30

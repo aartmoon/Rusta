@@ -1,6 +1,10 @@
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.net.Socket;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -48,6 +52,7 @@ public final class ClusterDataPathSmoke {
                 .setTransactionalId(null).setTransactionTimeoutMs(10000)).build((short) 4);
             var producer = ((InitProducerIdResponse) Smoke.exchange(leader.endpoint(), init, 1)).data();
             GroupSmoke.check(producer.errorCode() == 0, "producer ID allocation failed");
+            checkProducePipeline(leader(seeds, POLL, 0).endpoint(), producer.producerId(), producer.producerEpoch());
             retry(leader.endpoint(), producer.producerId(), producer.producerEpoch());
             try (var consumer = new KafkaConsumer<String, String>(GroupSmoke.consumer(seeds, "data-path"))) {
                 var initial = consumer.offsetsForTimes(Map.of(PARTITION, 0L), GroupSmoke.TIMEOUT).get(PARTITION);
@@ -124,6 +129,31 @@ public final class ClusterDataPathSmoke {
         GroupSmoke.check(end.errorCode() == 0 && end.leaderEpoch() == oldEpoch && end.endOffset() == 1,
             "leader epoch lookup did not preserve the retained boundary: " + end);
         retry(leader.endpoint(), producer, epoch);
+    }
+
+    private static void checkProducePipeline(String endpoint, long producerId, short epoch) throws Exception {
+        var parts = endpoint.split(":");
+        try (var socket = new Socket(parts[0], Integer.parseInt(parts[1]))) {
+            socket.setSoTimeout(5000);
+            var out = new DataOutputStream(socket.getOutputStream());
+            var in = new DataInputStream(socket.getInputStream());
+            var headers = new ArrayList<RequestHeader>();
+            for (int sequence = 0; sequence < 5; sequence++) {
+                var records = MemoryRecords.withIdempotentRecords(Compression.NONE, producerId, epoch, sequence,
+                    new SimpleRecord(RECORD_TIMESTAMP, new byte[] { (byte) sequence }));
+                var data = new ProduceRequestData().setAcks((short) -1).setTimeoutMs(3000);
+                data.topicData().add(new ProduceRequestData.TopicProduceData().setName(POLL)
+                    .setPartitionData(List.of(new ProduceRequestData.PartitionProduceData().setIndex(0).setRecords(records))));
+                headers.add(Smoke.writeRequest(out, ProduceRequest.builder(data).build((short) 11), 100 + sequence));
+            }
+            socket.shutdownOutput();
+            for (int sequence = 0; sequence < headers.size(); sequence++) {
+                var response = (ProduceResponse) Smoke.readResponse(in, headers.get(sequence));
+                var partition = response.data().responses().iterator().next().partitionResponses().getFirst();
+                GroupSmoke.check(partition.errorCode() == 0 && partition.baseOffset() == 2 + sequence,
+                    "pipelined Produce returned " + Errors.forCode(partition.errorCode()) + " at " + partition.baseOffset());
+            }
+        }
     }
 
     private static void retry(String endpoint, long producerId, short epoch) throws Exception {

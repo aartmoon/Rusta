@@ -16,6 +16,7 @@ use rusta_log::{Options, PartitionLog, Position};
 
 use crate::partition::MAX_BATCH;
 
+use super::ack_profile;
 use super::checkpoint::{self, DataCheckpoint};
 use super::producers::{IMPORTED_PRODUCERS, PRODUCER_CLOCK, Producers, RETIRE_PRODUCERS};
 
@@ -152,8 +153,12 @@ impl Disk {
         };
         let mut log = match cache {
             Some(recover) => PartitionLog::open_page_cached(root, options, recover)?,
+            None if !internal_entries => PartitionLog::open_raft_durable(root, options)?,
             None => PartitionLog::open(root, options)?,
         };
+        if !internal_entries && cache.is_none() && ack_profile::enabled() {
+            log.observe_syncs(ack_profile::record);
+        }
         if log.start().next_index == 1 {
             log.initialize_offset(initial_offset)?;
         }

@@ -1,7 +1,9 @@
+mod ack_profile;
 pub mod admin;
 mod checkpoint;
 mod disk;
 mod engine;
+mod executor;
 mod groups;
 mod kafka;
 mod producers;
@@ -18,13 +20,14 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 use rusta_kafka::protocol::StrBytes;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{Notify, Semaphore, mpsc};
 use uuid::Uuid;
 
 use crate::protocol::Endpoint;
 
 use self::engine::Engine;
 pub use self::engine::migration;
+pub(crate) use self::kafka::ProduceReply;
 
 #[derive(Clone)]
 pub struct Settings {
@@ -331,7 +334,9 @@ fn endpoint(value: &str) -> Result<Endpoint> {
 pub struct Cluster {
     engine: Mutex<Option<Engine>>,
     worker: Arc<Semaphore>,
+    executor: executor::Executor,
     batch_checks: Arc<Semaphore>,
+    produce_admissions: mpsc::Sender<kafka::ProduceAdmission>,
     data_available: Arc<Notify>,
     group_progress: Arc<Notify>,
     fetch_waiters: Semaphore,
@@ -360,6 +365,20 @@ impl Cluster {
         settings.select_ack_mode(root)?;
         settings.ensure_identity(root)?;
         let page_cache = settings.page_cache;
+        let group_commit_us = std::env::var("RUSTA_DURABLE_GROUP_COMMIT_US")
+            .as_deref()
+            .unwrap_or("0")
+            .parse::<u64>()
+            .context("invalid durable group commit window")?;
+        ensure!(
+            group_commit_us <= 2_000,
+            "durable group commit window exceeds 2000 us"
+        );
+        let group_commit_wait = if page_cache {
+            Duration::ZERO
+        } else {
+            Duration::from_micros(group_commit_us)
+        };
         if page_cache {
             settings.cache_recovery = activate_page_cache(root, kernel_boot_id()?)?;
         }
@@ -368,29 +387,46 @@ impl Cluster {
         let routes = transport::Routes::new(&settings, tls);
         let outbound = routes.connect_all(&settings);
         let node = Engine::open(settings.clone(), root, outbound)?;
+        let (produce_admissions, admissions) = mpsc::channel(64);
+        let executor = executor::Executor::new();
         let cluster = Arc::new(Self {
             data_available: node.data_available.clone(),
             group_progress: node.group_progress.clone(),
             fetch_waiters: Semaphore::new(crate::WAITING_FETCHES),
             engine: Mutex::new(Some(node)),
             worker: Arc::new(Semaphore::new(1)),
+            executor,
             batch_checks: Arc::new(Semaphore::new(2)),
+            produce_admissions,
             transport: routes,
             page_cache,
             root: root.to_owned(),
         });
         cluster.transport.listen(&settings, cluster.clone()).await?;
         admin::start(root, cluster.clone())?;
+        tokio::spawn(kafka::admit_produce(
+            Arc::downgrade(&cluster),
+            admissions,
+            group_commit_wait,
+        ));
         let ticking = cluster.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(50));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tick.tick().await;
-                if let Err(error) = ticking.call(Engine::tick).await {
-                    eprintln!("Raft timer stopped: {error:#}");
-                    break;
+                match ticking.call(|engine| engine.tick_groups(true)).await {
+                    Ok(keys) => {
+                        for key in keys {
+                            ticking.executor.tick(&ticking, key);
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("Raft timer stopped: {error:#}");
+                        break;
+                    }
                 }
+                ack_profile::report();
             }
         });
         Ok(cluster)
@@ -434,6 +470,18 @@ impl Cluster {
     }
 
     async fn call<T: Send + 'static>(
+        self: &Arc<Self>,
+        work: impl FnOnce(&mut Engine) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let topology = self.executor.topology.clone().write_owned().await;
+        self.call_unfenced(move |engine| {
+            let _topology = topology;
+            work(engine)
+        })
+        .await
+    }
+
+    async fn call_unfenced<T: Send + 'static>(
         self: &Arc<Self>,
         work: impl FnOnce(&mut Engine) -> Result<T> + Send + 'static,
     ) -> Result<T> {

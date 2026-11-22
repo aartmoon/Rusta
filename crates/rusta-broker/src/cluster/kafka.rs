@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use anyhow::{Result, ensure};
@@ -7,12 +7,12 @@ use bytes::{Bytes, BytesMut};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use rusta_kafka::{
     Header, Request, api_versions, encode,
-    messages::{self, BrokerId, ProducerId, TopicName},
+    messages::{self, BrokerId, ProducerId, TopicName, produce_response::PartitionProduceResponse},
     protocol::StrBytes,
     records::Batch,
 };
 use tokio::{
-    sync::oneshot,
+    sync::{mpsc, oneshot},
     time::{Instant, timeout, timeout_at},
 };
 use uuid::Uuid;
@@ -24,7 +24,7 @@ use crate::{
 };
 
 use super::{
-    Cluster,
+    Cluster, ack_profile,
     engine::{CONTROL, Engine, GroupId, Node, ProduceBatch, Write},
 };
 
@@ -61,6 +61,293 @@ async fn write_result(write: Write, deadline: Instant) -> Result<i64, Error> {
     timeout_at(deadline, answer)
         .await
         .map_err(|_| Error::RequestTimedOut)?
+}
+
+type ProduceAdmissionReply = oneshot::Sender<Result<Write, Error>>;
+
+pub(super) struct ProduceAdmission {
+    topic: TopicName,
+    partition: i32,
+    input: ProduceBatch,
+    reply: ProduceAdmissionReply,
+    queued: Option<std::time::Instant>,
+}
+
+pub(super) async fn admit_produce(
+    cluster: Weak<Cluster>,
+    mut receiver: mpsc::Receiver<ProduceAdmission>,
+    group_commit_wait: Duration,
+) {
+    while let Some(first) = receiver.recv().await {
+        if !group_commit_wait.is_zero() && !receiver.is_empty() {
+            tokio::time::sleep(group_commit_wait).await;
+        }
+        let Some(cluster) = cluster.upgrade() else {
+            break;
+        };
+        if !cluster.page_cache {
+            let routed = cluster
+                .call_unfenced(move |engine| {
+                    let mut groups = BTreeMap::<_, Vec<_>>::new();
+                    for admission in std::iter::once(first)
+                        .chain(std::iter::from_fn(|| receiver.try_recv().ok()))
+                        .take(32)
+                    {
+                        match engine.topic_key(admission.topic.0.as_str(), admission.partition) {
+                            Ok(key) => groups.entry(key).or_default().push(admission),
+                            Err(error) => {
+                                let _ = admission.reply.send(Err(error));
+                            }
+                        }
+                    }
+                    Ok((receiver, groups))
+                })
+                .await;
+            let (next, groups) = match routed {
+                Ok(routed) => routed,
+                Err(error) => {
+                    eprintln!("Produce routing stopped: {error:#}");
+                    break;
+                }
+            };
+            receiver = next;
+            for (key, group) in groups {
+                if let Err(error) = cluster
+                    .executor
+                    .submit(
+                        &cluster,
+                        key,
+                        group,
+                        |partition, group| {
+                            complete_admissions(group, |inputs| partition.produce(inputs))
+                        },
+                        move |engine, group| {
+                            complete_admissions(group, |inputs| engine.produce_batch(key, inputs))
+                        },
+                    )
+                    .await
+                {
+                    eprintln!("Produce enqueue failed: {error:#}");
+                }
+            }
+            continue;
+        }
+        let submitted = cluster
+            .call(move |engine| {
+                let mut groups: BTreeMap<_, Vec<_>> = BTreeMap::new();
+                // Take existing work once the engine is available. An idle partition pays no linger.
+                for admission in std::iter::once(first)
+                    .chain(std::iter::from_fn(|| receiver.try_recv().ok()))
+                    .take(32)
+                {
+                    ack_profile::finish("produce_worker_queue", admission.queued);
+                    match engine.topic_key(admission.topic.0.as_str(), admission.partition) {
+                        Ok(key) => groups
+                            .entry(key)
+                            .or_default()
+                            .push((admission.input, admission.reply)),
+                        Err(error) => {
+                            let _ = admission.reply.send(Err(error));
+                        }
+                    }
+                }
+                for (key, group) in groups {
+                    let (inputs, replies): (Vec<_>, Vec<_>) = group.into_iter().unzip();
+                    for (reply, write) in
+                        replies.into_iter().zip(engine.produce_batch(key, inputs)?)
+                    {
+                        let _ = reply.send(write);
+                    }
+                }
+                Ok(receiver)
+            })
+            .await;
+        match submitted {
+            Ok(next) => receiver = next,
+            Err(error) => {
+                eprintln!("Produce admission stopped: {error:#}");
+                break;
+            }
+        }
+    }
+}
+
+fn complete_admissions(
+    group: Vec<ProduceAdmission>,
+    produce: impl FnOnce(Vec<ProduceBatch>) -> Result<Vec<Result<Write, Error>>>,
+) -> Result<()> {
+    let (inputs, replies): (Vec<_>, Vec<_>) = group
+        .into_iter()
+        .map(|entry| {
+            ack_profile::finish("produce_worker_queue", entry.queued);
+            (entry.input, entry.reply)
+        })
+        .unzip();
+    for (reply, result) in replies.into_iter().zip(produce(inputs)?) {
+        let _ = reply.send(result);
+    }
+    Ok(())
+}
+
+pub(crate) struct ProduceReply {
+    response: messages::ProduceResponse,
+    writes: Vec<(usize, usize, Write, Instant)>,
+    started: Option<std::time::Instant>,
+}
+
+fn record_produce_result(result: &mut PartitionProduceResponse, outcome: Result<i64, Error>) {
+    match outcome {
+        Ok(offset) => {
+            result.base_offset = offset;
+            result.log_start_offset = 0;
+        }
+        Err(error) => result.error_code = error as i16,
+    }
+}
+
+impl ProduceReply {
+    pub(crate) async fn finish(mut self, head: &Header) -> Result<Bytes> {
+        let mut pending: FuturesUnordered<_> = self
+            .writes
+            .into_iter()
+            .map(|(topic, partition, write, deadline)| async move {
+                (topic, partition, write_result(write, deadline).await)
+            })
+            .collect();
+        while let Some((topic, partition, outcome)) = pending.next().await {
+            record_produce_result(
+                &mut self.response.responses[topic].partition_responses[partition],
+                outcome,
+            );
+        }
+        let response = encode(head, head.version, &self.response)?;
+        ack_profile::finish("produce_request", self.started);
+        Ok(response)
+    }
+}
+
+type ReadAuthorization = (GroupId, i32, oneshot::Receiver<Result<(), Error>>);
+
+fn read_key(
+    engine: &Engine,
+    name: Option<&str>,
+    id: Uuid,
+    partition: i32,
+) -> Result<GroupId, Error> {
+    let name = match name {
+        Some(name) => name,
+        None => engine.names.get(&id).ok_or(Error::UnknownTopicId)?.as_str(),
+    };
+    engine.topic_key(name, partition)
+}
+
+fn check_read_epoch(node: &Node, expected: i32) -> Result<i32, Error> {
+    let epoch = node.epoch();
+    if !node.local_leader() {
+        return Err(Error::NotLeader);
+    }
+    if expected > epoch {
+        return Err(Error::UnknownLeaderEpoch);
+    }
+    if expected >= 0 && expected < epoch {
+        return Err(Error::FencedLeaderEpoch);
+    }
+    Ok(epoch)
+}
+
+fn authorize_key(
+    engine: &mut Engine,
+    key: GroupId,
+    expected: i32,
+) -> Result<Result<ReadAuthorization, Error>> {
+    let Some(node) = engine.nodes.get(&key) else {
+        return Ok(Err(Error::NotLeader));
+    };
+    let epoch = match check_read_epoch(node, expected) {
+        Ok(epoch) => epoch,
+        Err(error) => return Ok(Err(error)),
+    };
+    engine
+        .read(key)
+        .map(|result| result.map(|receiver| (key, epoch, receiver)))
+}
+
+fn authorize_read(
+    engine: &mut Engine,
+    name: Option<&str>,
+    id: Uuid,
+    partition: i32,
+    epoch: i32,
+) -> Result<Result<ReadAuthorization, Error>> {
+    match read_key(engine, name, id, partition) {
+        Ok(key) => authorize_key(engine, key, epoch),
+        Err(error) => Ok(Err(error)),
+    }
+}
+
+fn read_at_epoch<T>(
+    node: &Node,
+    epoch: i32,
+    read: impl FnOnce(&Node) -> Result<T, Error>,
+) -> Result<T, Error> {
+    if !node.local_leader() || node.epoch() != epoch {
+        return Err(Error::NotLeader);
+    }
+    read(node)
+}
+
+struct FetchRead {
+    offset: i64,
+    limit: i32,
+    remaining: usize,
+    first: bool,
+}
+
+type FetchRecords = (i64, i64, Bytes, Option<Error>);
+
+fn fetch_partition(node: &Node, input: FetchRead) -> Result<FetchRecords, Error> {
+    let log = node.log();
+    let start = node.log_start();
+    let end = log.committed().next_offset;
+    if !(start..=end).contains(&input.offset) {
+        return Ok((start, end, Bytes::new(), Some(Error::OffsetOutOfRange)));
+    }
+    if input.limit < 0 {
+        return Err(Error::InvalidRequest);
+    }
+    let mut records = BytesMut::new();
+    log.visit_batches(input.offset, &mut Vec::new(), |_, bytes| {
+        if (!input.first || !records.is_empty()) && records.len() + bytes.len() > input.remaining {
+            return Ok(false);
+        }
+        records.extend_from_slice(bytes);
+        Ok(records.len() < input.remaining)
+    })
+    .map_err(Error::storage)?;
+    Ok((start, end, records.freeze(), None))
+}
+
+fn fetch_response(
+    partition: i32,
+    result: Result<FetchRecords, Error>,
+    used: &mut usize,
+) -> messages::fetch_response::PartitionData {
+    use messages::fetch_response::PartitionData;
+    let mut response = PartitionData::default().with_partition_index(partition);
+    match result {
+        Ok((start, end, records, error)) => {
+            response.error_code = code(error);
+            response.log_start_offset = start;
+            response.high_watermark = end;
+            response.last_stable_offset = end;
+            *used += records.len();
+            response.records = Some(records);
+        }
+        // Kafka consumers retry when a quorum cannot yet confirm this offset.
+        Err(Error::RequestTimedOut) => response.error_code = Error::OffsetNotAvailable as i16,
+        Err(error) => response.error_code = error as i16,
+    }
+    response
 }
 
 impl Cluster {
@@ -127,10 +414,7 @@ impl Cluster {
                 }
                 encode(head, version, &response)?
             }
-            Request::Produce(request) => {
-                ensure!(request.acks != 0, "cluster requires acknowledged writes");
-                encode(head, version, &self.produce(request).await?)?
-            }
+            Request::Produce(request) => self.stage_produce(request).await?.finish(head).await?,
             Request::Fetch(request) => encode(head, version, &self.fetch(request, version).await?)?,
             Request::ListOffsets(request) => {
                 encode(head, version, &self.list_offsets(request).await?)?
@@ -257,11 +541,13 @@ impl Cluster {
         Ok(messages::CreateTopicsResponse::default().with_topics(results))
     }
 
-    async fn produce(
+    pub(crate) async fn stage_produce(
         self: &Arc<Self>,
         request: messages::ProduceRequest,
-    ) -> Result<messages::ProduceResponse> {
-        use messages::produce_response::{PartitionProduceResponse, TopicProduceResponse};
+    ) -> Result<ProduceReply> {
+        use messages::produce_response::TopicProduceResponse;
+        ensure!(request.acks != 0, "cluster requires acknowledged writes");
+        let started = ack_profile::start();
         let request_error = if request.transactional_id.is_some() {
             Some(Error::UnsupportedVersion)
         } else if request.acks != -1 {
@@ -301,7 +587,9 @@ impl Cluster {
             .into_iter()
             .map(|((name, index), writes)| async move {
                 let mut outcomes = Vec::with_capacity(writes.len());
-                for (topic_slot, partition_slot, records) in writes {
+                let mut writes = writes.into_iter().peekable();
+                let mut tail = None;
+                while let Some((topic_slot, partition_slot, records)) = writes.next() {
                     let input =
                         if records.len() <= 64 * 1024 && !Batch::needs_decompression(&records) {
                             ProduceBatch::inspect(records)
@@ -313,37 +601,47 @@ impl Cluster {
                             })
                             .await?
                         };
-                    let topic = name.clone();
-                    let proposed = self
-                        .call(
-                            move |engine| match engine.topic_key(topic.0.as_str(), index) {
-                                Ok(key) => engine.produce(key, input),
-                                Err(error) => Ok(Err(error)),
-                            },
-                        )
+                    let (reply, admitted) = oneshot::channel();
+                    self.produce_admissions
+                        .send(ProduceAdmission {
+                            topic: name.clone(),
+                            partition: index,
+                            input,
+                            reply,
+                            queued: ack_profile::start(),
+                        })
                         .await?;
+                    let proposed = admitted.await?;
+                    let deadline = Instant::now() + DEADLINE;
                     let outcome = match proposed {
-                        Ok(write) => write_result(write, Instant::now() + DEADLINE).await,
+                        Ok(write) if writes.peek().is_none() => {
+                            tail = Some((topic_slot, partition_slot, write, deadline));
+                            break;
+                        }
+                        Ok(write) => write_result(write, deadline).await,
                         Err(error) => Err(error),
                     };
                     outcomes.push((topic_slot, partition_slot, outcome));
                 }
-                Ok::<_, anyhow::Error>(outcomes)
+                Ok::<_, anyhow::Error>((outcomes, tail))
             })
             .collect();
-        while let Some(completed) = completions.next().await {
-            for (topic, partition, outcome) in completed? {
-                let result = &mut responses[topic].partition_responses[partition];
-                match outcome {
-                    Ok(offset) => {
-                        result.base_offset = offset;
-                        result.log_start_offset = 0;
-                    }
-                    Err(error) => result.error_code = error as i16,
-                }
+        let mut pending = Vec::new();
+        while let Some(result) = completions.next().await {
+            let (outcomes, tail) = result?;
+            pending.extend(tail);
+            for (topic, partition, outcome) in outcomes {
+                record_produce_result(
+                    &mut responses[topic].partition_responses[partition],
+                    outcome,
+                );
             }
         }
-        Ok(messages::ProduceResponse::default().with_responses(responses))
+        Ok(ProduceReply {
+            response: messages::ProduceResponse::default().with_responses(responses),
+            writes: pending,
+            started,
+        })
     }
 
     async fn guarded<T: Send + 'static>(
@@ -354,37 +652,31 @@ impl Cluster {
         expected_epoch: i32,
         read: impl FnOnce(&Node) -> Result<T, Error> + Send + 'static,
     ) -> Result<Result<T, Error>> {
+        if !self.page_cache {
+            let key = self
+                .call_unfenced(move |engine| Ok(read_key(engine, name.as_deref(), id, partition)))
+                .await?;
+            return match key {
+                Ok(key) => {
+                    let authorization = self.submit_read(key, expected_epoch).await?.await??;
+                    self.read_authorized(authorization, read).await
+                }
+                Err(error) => Ok(Err(error)),
+            };
+        }
         let authorization = self
             .call(move |engine| {
-                let name = match name.as_deref() {
-                    Some(name) => name,
-                    None => match engine.names.get(&id) {
-                        Some(name) => name,
-                        None => return Ok(Err(Error::UnknownTopicId)),
-                    },
-                };
-                let key = match engine.topic_key(name, partition) {
-                    Ok(key) => key,
-                    Err(error) => return Ok(Err(error)),
-                };
-                let Some(node) = engine.nodes.get(&key) else {
-                    return Ok(Err(Error::NotLeader));
-                };
-                let epoch = node.epoch();
-                if !node.local_leader() {
-                    return Ok(Err(Error::NotLeader));
-                }
-                if expected_epoch > epoch {
-                    return Ok(Err(Error::UnknownLeaderEpoch));
-                }
-                if expected_epoch >= 0 && expected_epoch < epoch {
-                    return Ok(Err(Error::FencedLeaderEpoch));
-                }
-                engine
-                    .read(key)
-                    .map(|result| result.map(|receiver| (key, epoch, receiver)))
+                authorize_read(engine, name.as_deref(), id, partition, expected_epoch)
             })
             .await?;
+        self.read_authorized(authorization, read).await
+    }
+
+    async fn read_authorized<T: Send + 'static>(
+        self: &Arc<Self>,
+        authorization: Result<ReadAuthorization, Error>,
+        read: impl FnOnce(&Node) -> Result<T, Error> + Send + 'static,
+    ) -> Result<Result<T, Error>> {
         let (key, epoch, receiver) = match authorization {
             Ok(data) => data,
             Err(error) => return Ok(Err(error)),
@@ -392,16 +684,65 @@ impl Cluster {
         if let Err(error) = reply(receiver).await {
             return Ok(Err(error));
         }
+        if !self.page_cache {
+            return self.read_partition(key, epoch, read).await;
+        }
         self.call(move |engine| {
-            let Some(node) = engine.nodes.get(&key) else {
-                return Ok(Err(Error::NotLeader));
-            };
-            if !node.local_leader() || node.epoch() != epoch {
-                return Ok(Err(Error::NotLeader));
-            }
-            Ok(read(node))
+            Ok(engine
+                .nodes
+                .get(&key)
+                .ok_or(Error::NotLeader)
+                .and_then(|node| read_at_epoch(node, epoch, read)))
         })
         .await
+    }
+
+    async fn submit_read(
+        self: &Arc<Self>,
+        key: GroupId,
+        expected: i32,
+    ) -> Result<oneshot::Receiver<Result<Result<ReadAuthorization, Error>>>> {
+        self.executor
+            .submit(
+                self,
+                key,
+                expected,
+                move |partition, expected| {
+                    let epoch = match check_read_epoch(&partition.node, expected) {
+                        Ok(epoch) => epoch,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    partition
+                        .read()
+                        .map(|result| result.map(|receiver| (key, epoch, receiver)))
+                },
+                move |engine, expected| authorize_key(engine, key, expected),
+            )
+            .await
+    }
+
+    async fn read_partition<T: Send + 'static>(
+        self: &Arc<Self>,
+        key: GroupId,
+        epoch: i32,
+        read: impl FnOnce(&Node) -> Result<T, Error> + Send + 'static,
+    ) -> Result<Result<T, Error>> {
+        self.executor
+            .submit(
+                self,
+                key,
+                read,
+                move |partition, read| Ok(read_at_epoch(&partition.node, epoch, read)),
+                move |engine, read| {
+                    Ok(engine
+                        .nodes
+                        .get(&key)
+                        .ok_or(Error::NotLeader)
+                        .and_then(|node| read_at_epoch(node, epoch, read)))
+                },
+            )
+            .await?
+            .await?
     }
 
     async fn fetch(
@@ -448,68 +789,209 @@ impl Cluster {
         version: i16,
         deadline: Instant,
     ) -> Result<(messages::FetchResponse, usize, bool)> {
-        use messages::fetch_response::{FetchableTopicResponse, PartitionData};
-        let mut failed = false;
         let maximum = (request.max_bytes as usize).min(FETCH_MAX);
+        let targets: Vec<_> = request
+            .topics
+            .iter()
+            .flat_map(|topic| {
+                topic.partitions.iter().map(move |part| {
+                    let name = (version == 12).then(|| topic.topic.0.clone());
+                    (
+                        name,
+                        topic.topic_id,
+                        part.partition,
+                        part.current_leader_epoch,
+                    )
+                })
+            })
+            .collect();
+        let count = targets.len();
+        // Start the quorum barriers together, then spend the byte budget in wire order.
+        let authorizations = if self.page_cache {
+            match timeout_at(
+                deadline,
+                self.call(move |engine| {
+                    targets
+                        .into_iter()
+                        .map(|(name, id, partition, epoch)| {
+                            if Instant::now() >= deadline {
+                                return Ok(Err(Error::RequestTimedOut));
+                            }
+                            authorize_read(
+                                engine,
+                                name.as_ref().map(StrBytes::as_str),
+                                id,
+                                partition,
+                                epoch,
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()
+                }),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => (0..count).map(|_| Err(Error::RequestTimedOut)).collect(),
+            }
+        } else {
+            let resolved = self
+                .call_unfenced(move |engine| {
+                    Ok(targets
+                        .into_iter()
+                        .map(|(name, id, part, epoch)| {
+                            read_key(engine, name.as_ref().map(StrBytes::as_str), id, part)
+                                .map(|key| (key, epoch))
+                        })
+                        .collect::<Vec<_>>())
+                })
+                .await?;
+            let mut pending = Vec::with_capacity(count);
+            for target in resolved {
+                let submitted = match target {
+                    Ok((key, epoch)) => {
+                        match timeout_at(deadline, self.submit_read(key, epoch)).await {
+                            Ok(result) => Ok(result?),
+                            Err(_) => Err(Error::RequestTimedOut),
+                        }
+                    }
+                    Err(error) => Err(error),
+                };
+                pending.push(submitted);
+            }
+            let mut authorizations = Vec::with_capacity(count);
+            for item in pending {
+                authorizations.push(match item {
+                    Ok(reply) => match timeout_at(deadline, reply).await {
+                        Ok(result) => result??,
+                        Err(_) => Err(Error::RequestTimedOut),
+                    },
+                    Err(error) => Err(error),
+                });
+            }
+            authorizations
+        };
+        let mut confirmed = Vec::with_capacity(count);
+        for authorization in authorizations {
+            let result = match authorization {
+                Ok((key, epoch, receiver)) => match timeout_at(deadline, reply(receiver)).await {
+                    Ok(result) => result.map(|()| (key, epoch)),
+                    Err(_) => Err(Error::RequestTimedOut),
+                },
+                Err(error) => Err(error),
+            };
+            confirmed.push(result);
+        }
+        let topics = request.topics.clone();
+        if self.page_cache {
+            return self
+                .call(move |engine| {
+                    Ok(Self::materialize_fetch(
+                        engine, topics, confirmed, maximum, deadline,
+                    ))
+                })
+                .await;
+        }
+        self.materialize_detached_fetch(topics, confirmed, maximum, deadline)
+            .await
+    }
+
+    async fn materialize_detached_fetch(
+        self: &Arc<Self>,
+        topics: Vec<messages::fetch_request::FetchTopic>,
+        confirmed: Vec<Result<(GroupId, i32), Error>>,
+        maximum: usize,
+        deadline: Instant,
+    ) -> Result<(messages::FetchResponse, usize, bool)> {
+        use messages::fetch_response::FetchableTopicResponse;
+        let mut failed = false;
         let mut used = 0;
         let mut responses = Vec::new();
-        for topic in &request.topics {
+        let mut confirmed = confirmed.into_iter();
+        for topic in topics {
             let mut partitions = Vec::new();
-            for part in topic.partitions.iter().cloned() {
-                let mut response = PartitionData::default().with_partition_index(part.partition);
-                let name = (version == 12).then(|| topic.topic.0.as_str().to_owned());
+            for part in topic.partitions {
+                let result = match confirmed.next().expect("one barrier per Fetch partition") {
+                    Ok((key, epoch)) => {
+                        let input = FetchRead {
+                            offset: part.fetch_offset,
+                            limit: part.partition_max_bytes,
+                            remaining: maximum
+                                .saturating_sub(used)
+                                .min(part.partition_max_bytes.max(0) as usize),
+                            first: used == 0,
+                        };
+                        match timeout_at(
+                            deadline,
+                            self.read_partition(key, epoch, move |node| {
+                                fetch_partition(node, input)
+                            }),
+                        )
+                        .await
+                        {
+                            Ok(result) => result?,
+                            Err(_) => Err(Error::RequestTimedOut),
+                        }
+                    }
+                    Err(error) => Err(error),
+                };
+                let response = fetch_response(part.partition, result, &mut used);
+                failed |= response.error_code != 0;
+                partitions.push(response);
+            }
+            responses.push(
+                FetchableTopicResponse::default()
+                    .with_topic(topic.topic)
+                    .with_topic_id(topic.topic_id)
+                    .with_partitions(partitions),
+            );
+        }
+        Ok((
+            messages::FetchResponse::default().with_responses(responses),
+            used,
+            failed,
+        ))
+    }
+
+    fn materialize_fetch(
+        engine: &Engine,
+        topics: Vec<messages::fetch_request::FetchTopic>,
+        confirmed: Vec<Result<(GroupId, i32), Error>>,
+        maximum: usize,
+        deadline: Instant,
+    ) -> (messages::FetchResponse, usize, bool) {
+        use messages::fetch_response::FetchableTopicResponse;
+        let mut failed = false;
+        let mut used = 0;
+        let mut responses = Vec::new();
+        let mut confirmed = confirmed.into_iter();
+        for topic in topics {
+            let mut partitions = Vec::new();
+            for part in topic.partitions {
                 let remaining = maximum
                     .saturating_sub(used)
                     .min(part.partition_max_bytes.max(0) as usize);
                 let first = used == 0;
-                let read = self.guarded(
-                    name,
-                    topic.topic_id,
-                    part.partition,
-                    part.current_leader_epoch,
-                    move |node| {
-                        let log = node.log();
-                        let start = node.log_start();
-                        let end = log.committed().next_offset;
-                        if !(start..=end).contains(&part.fetch_offset) {
-                            return Ok((start, end, Bytes::new(), Some(Error::OffsetOutOfRange)));
-                        }
-                        if part.partition_max_bytes < 0 {
-                            return Err(Error::InvalidRequest);
-                        }
-                        let mut records = BytesMut::new();
-                        log.visit_batches(part.fetch_offset, &mut Vec::new(), |_, bytes| {
-                            if (!first || !records.is_empty())
-                                && records.len() + bytes.len() > remaining
-                            {
-                                return Ok(false);
-                            }
-                            records.extend_from_slice(bytes);
-                            Ok(records.len() < remaining)
-                        })
-                        .map_err(Error::storage)?;
-                        Ok((start, end, records.freeze(), None))
-                    },
-                );
-                let result = if Instant::now() >= deadline {
-                    Err(Error::RequestTimedOut)
-                } else {
-                    match timeout_at(deadline, read).await {
-                        Ok(result) => result?,
-                        Err(_) => Err(Error::RequestTimedOut),
+                let authorization = confirmed.next().expect("one barrier per Fetch partition");
+                let result = authorization.and_then(|(key, epoch)| {
+                    if Instant::now() >= deadline {
+                        return Err(Error::RequestTimedOut);
                     }
-                };
-                match result {
-                    Ok((start, end, records, error)) => {
-                        response.error_code = code(error);
-                        response.log_start_offset = start;
-                        response.high_watermark = end;
-                        response.last_stable_offset = end;
-                        used += records.len();
-                        response.records = Some(records);
-                    }
-                    Err(error) => response.error_code = error as i16,
-                }
+                    let node = engine
+                        .nodes
+                        .get(&key)
+                        .filter(|node| node.local_leader() && node.epoch() == epoch)
+                        .ok_or(Error::NotLeader)?;
+                    fetch_partition(
+                        node,
+                        FetchRead {
+                            offset: part.fetch_offset,
+                            limit: part.partition_max_bytes,
+                            remaining,
+                            first,
+                        },
+                    )
+                });
+                let response = fetch_response(part.partition, result, &mut used);
                 failed |= response.error_code != 0;
                 partitions.push(response);
             }
@@ -520,11 +1002,11 @@ impl Cluster {
                     .with_partitions(partitions),
             );
         }
-        Ok((
+        (
             messages::FetchResponse::default().with_responses(responses),
             used,
             failed,
-        ))
+        )
     }
 
     async fn list_offsets(

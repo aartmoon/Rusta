@@ -16,6 +16,7 @@ import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.compress.Compression;
 import org.apache.kafka.common.message.InitProducerIdRequestData;
 import org.apache.kafka.common.message.ProduceRequestData;
+import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.record.MemoryRecords;
 import org.apache.kafka.common.record.SimpleRecord;
 import org.apache.kafka.common.requests.*;
@@ -165,7 +166,9 @@ public final class ClusterSmoke {
             .setMaxBytes(1024 * 1024).build((short) 12);
         var reply = (FetchResponse) Smoke.exchange(endpoint, fetch, 3);
         var part = reply.data().responses().get(0).partitions().get(0);
-        GroupSmoke.check(part.errorCode() == 6 || part.errorCode() == 7, "minority attempt returned unexpected Fetch code " + part.errorCode());
+        GroupSmoke.check(part.errorCode() == Errors.NOT_LEADER_OR_FOLLOWER.code()
+            || part.errorCode() == Errors.OFFSET_NOT_AVAILABLE.code(),
+            "minority attempt returned unexpected Fetch code " + part.errorCode());
         GroupSmoke.check(part.records() == null || part.records().sizeInBytes() == 0, "minority exposed records");
     }
 }

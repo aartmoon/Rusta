@@ -54,6 +54,7 @@ pub enum Error {
     FencedLeaderEpoch = 74,
     UnknownLeaderEpoch = 75,
     UnsupportedCompression = 76,
+    OffsetNotAvailable = 78,
     MemberIdRequired = 79,
     GroupMaxSizeReached = 81,
     InvalidRecord = 87,

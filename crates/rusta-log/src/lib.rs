@@ -7,10 +7,11 @@ mod segment;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use format::{
-    Checkpoint, HEADER_LEN, MAX_PAYLOAD, batch_fields, batch_max_timestamp, corrupt, invalid,
-    write_entry,
+    Checkpoint, HEADER_LEN, MAX_PAYLOAD, ProgressManifest, batch_fields, batch_max_timestamp,
+    corrupt, invalid, write_entry,
 };
 pub use format::{Entry, Position};
 use segment::{Cursor, MAX_SEGMENTS, Scan, Segment, list, path};
@@ -50,6 +51,9 @@ pub struct PartitionLog {
     page_cache: bool,
     needs_flush: bool,
     stable_manifest: bool,
+    progress_manifest: Option<ProgressManifest>,
+    segment_directory_dirty: bool,
+    sync_observer: Option<fn(&'static str, Duration)>,
     failed: bool,
     _lock: File,
 }
@@ -57,7 +61,12 @@ pub struct PartitionLog {
 impl PartitionLog {
     /// Open a partition. Its parent directory must already exist.
     pub fn open(root: impl AsRef<Path>, options: Options) -> io::Result<Self> {
-        Self::open_inner(root.as_ref(), options, None)
+        Self::open_inner(root.as_ref(), options, None, false)
+    }
+
+    /// Open a durable Raft data log, atomically upgrading a legacy manifest if present.
+    pub fn open_raft_durable(root: impl AsRef<Path>, options: Options) -> io::Result<Self> {
+        Self::open_inner(root.as_ref(), options, None, true)
     }
 
     /// Open a replica whose buffered progress is protected by a kernel boot fence.
@@ -67,10 +76,15 @@ impl PartitionLog {
         options: Options,
         recover_from_disk: bool,
     ) -> io::Result<Self> {
-        Self::open_inner(root.as_ref(), options, Some(recover_from_disk))
+        Self::open_inner(root.as_ref(), options, Some(recover_from_disk), false)
     }
 
-    fn open_inner(root: &Path, options: Options, cache: Option<bool>) -> io::Result<Self> {
+    fn open_inner(
+        root: &Path,
+        options: Options,
+        cache: Option<bool>,
+        durable_raft: bool,
+    ) -> io::Result<Self> {
         if options.segment_bytes < HEADER_LEN
             || options.max_entry_bytes == 0
             || options.max_entry_bytes > MAX_PAYLOAD
@@ -111,7 +125,14 @@ impl PartitionLog {
                     Err(error)
                 }
             })?;
-        let checkpoint = match if let (Some(true), Some(stable)) = (cache, stable) {
+        let progress = if durable_raft {
+            ProgressManifest::open(&root)?
+        } else {
+            None
+        };
+        let checkpoint = match if let Some((_, checkpoint)) = &progress {
+            Ok(*checkpoint)
+        } else if let (Some(true), Some(stable)) = (cache, stable) {
             Ok(stable)
         } else {
             Checkpoint::load(&root)
@@ -130,7 +151,9 @@ impl PartitionLog {
             Ok(checkpoint) => checkpoint,
             Err(error) if error.kind() == ErrorKind::NotFound && indexes.is_empty() => {
                 let checkpoint = Checkpoint::initial();
-                checkpoint.save(&root)?;
+                if !durable_raft {
+                    checkpoint.save(&root)?;
+                }
                 checkpoint
             }
             Err(error) => return Err(error),
@@ -139,6 +162,11 @@ impl PartitionLog {
             checkpoint.save(&root)?;
         }
         let segments = recover(&root, checkpoint, &indexes)?;
+        let progress_manifest = match progress {
+            Some((manifest, _)) => Some(manifest),
+            None if durable_raft => Some(ProgressManifest::create(&root, checkpoint)?),
+            None => None,
+        };
         let mut log = Self {
             root,
             options,
@@ -148,6 +176,9 @@ impl PartitionLog {
             page_cache: false,
             needs_flush: false,
             stable_manifest: cache.is_some(),
+            progress_manifest,
+            segment_directory_dirty: false,
+            sync_observer: None,
             failed: false,
             _lock: lock,
         };
@@ -158,6 +189,11 @@ impl PartitionLog {
         Ok(log)
     }
 
+    /// Observe successful data and progress-manifest syncs for diagnostics.
+    pub fn observe_syncs(&mut self, observer: fn(&'static str, Duration)) {
+        self.sync_observer = Some(observer);
+    }
+
     pub fn start(&self) -> Position {
         self.checkpoint.start
     }
@@ -165,6 +201,10 @@ impl PartitionLog {
     /// The caller must fence any reopened volume whose kernel cache could
     /// have been lost. Normal checkpoint and retention operations stay durable.
     pub fn enable_page_cache(&mut self) {
+        assert!(
+            self.progress_manifest.is_none(),
+            "durable Raft logs cannot use page-cache ACKs"
+        );
         self.page_cache = true;
         // An earlier process on the same boot may have left data in cache.
         self.needs_flush = true;
@@ -276,7 +316,10 @@ impl PartitionLog {
         }
         self.mutate(|log| {
             if roll {
-                if let Some(previous) = log.writer.take() {
+                let sync_previous = log.progress_manifest.is_none() || log.end() != log.durable();
+                if let Some(previous) = log.writer.take()
+                    && sync_previous
+                {
                     previous.sync_data()?;
                 }
                 log.writer = Some(
@@ -285,6 +328,7 @@ impl PartitionLog {
                         .create_new(true)
                         .open(path(&log.root, entry.position.next_index))?,
                 );
+                log.segment_directory_dirty = log.progress_manifest.is_some();
                 log.segments.push(Segment::new(entry.position));
             } else if log.writer.is_none() {
                 let last = log.segments.last().expect("existing segment");
@@ -339,10 +383,14 @@ impl PartitionLog {
         }
         self.mutate(|log| {
             if log.durable() != end && !log.page_cache {
+                let started = log.sync_observer.map(|observer| (observer, Instant::now()));
                 log.writer
                     .as_ref()
                     .expect("staged writes have an open writer")
                     .sync_data()?;
+                if let Some((observe, started)) = started {
+                    observe("segment_sync", started.elapsed());
+                }
             }
             log.save_progress(Checkpoint {
                 durable: end,
@@ -801,7 +849,16 @@ impl PartitionLog {
             }
             self.needs_flush = false;
         }
-        checkpoint.save(&self.root)?;
+        if let Some(manifest) = &mut self.progress_manifest {
+            if self.segment_directory_dirty {
+                // Publish the segment name before publishing a checkpoint that depends on it.
+                File::open(&self.root)?.sync_all()?;
+                self.segment_directory_dirty = false;
+            }
+            manifest.save(checkpoint)?;
+        } else {
+            checkpoint.save(&self.root)?;
+        }
         if self.stable_manifest {
             checkpoint.save_stable(&self.root)?;
         }
@@ -816,7 +873,22 @@ impl PartitionLog {
             self.needs_flush = true;
             Ok(())
         } else {
-            self.save(checkpoint)
+            let started = self
+                .sync_observer
+                .map(|observer| (observer, Instant::now()));
+            let stage = match (
+                checkpoint.durable != self.checkpoint.durable,
+                checkpoint.committed != self.checkpoint.committed,
+            ) {
+                (true, true) => "append_and_commit_manifest",
+                (true, false) => "append_manifest",
+                (false, _) => "commit_manifest",
+            };
+            self.save(checkpoint)?;
+            if let Some((observe, started)) = started {
+                observe(stage, started.elapsed());
+            }
+            Ok(())
         }
     }
 

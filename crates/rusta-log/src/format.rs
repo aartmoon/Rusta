@@ -1,5 +1,5 @@
-use std::fs::{self, File};
-use std::io::{self, ErrorKind, Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crc32c::{crc32c, crc32c_append};
@@ -7,6 +7,9 @@ use crc32c::{crc32c, crc32c_append};
 const MANIFEST: &str = "manifest";
 const MAGIC: &[u8; 8] = b"RUSTAL01";
 const CHECKPOINT_LEN: usize = 68;
+// Keep the two records on separate filesystem pages, including on 64 KiB Linux kernels.
+const SLOT_STRIDE: u64 = 64 * 1024;
+const SLOT_LEN: usize = 8 + CHECKPOINT_LEN + 4;
 pub(crate) const HEADER_LEN: u64 = 36;
 pub(crate) const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
 
@@ -72,18 +75,22 @@ impl Checkpoint {
             return Err(corrupt("invalid manifest size"));
         }
         file.read_exact(&mut bytes)?;
-        if &bytes[..8] != MAGIC || crc32c(&bytes[..64]) != u32::from_be_bytes(field(&bytes, 64)) {
+        Self::decode(&bytes)
+    }
+
+    fn decode(bytes: &[u8; CHECKPOINT_LEN]) -> io::Result<Self> {
+        if &bytes[..8] != MAGIC || crc32c(&bytes[..64]) != u32::from_be_bytes(field(bytes, 64)) {
             return Err(corrupt("invalid manifest version or checksum"));
         }
         let position_at = |offset| Position {
-            next_index: u64::from_be_bytes(field(&bytes, offset)),
-            next_offset: i64::from_be_bytes(field(&bytes, offset + 8)),
+            next_index: u64::from_be_bytes(field(bytes, offset)),
+            next_offset: i64::from_be_bytes(field(bytes, offset + 8)),
         };
         let checkpoint = Self {
             start: position_at(8),
             durable: position_at(24),
             committed: position_at(40),
-            start_term: u64::from_be_bytes(field(&bytes, 56)),
+            start_term: u64::from_be_bytes(field(bytes, 56)),
         };
         if checkpoint.start.next_index == 0
             || checkpoint.start.next_offset < 0
@@ -110,7 +117,7 @@ impl Checkpoint {
         self.write_manifest(root, "manifest.stable", true)
     }
 
-    fn write_manifest(self, root: &Path, name: &str, sync: bool) -> io::Result<()> {
+    fn encode(self) -> [u8; CHECKPOINT_LEN] {
         let mut bytes = [0; CHECKPOINT_LEN];
         bytes[..8].copy_from_slice(MAGIC);
         for (offset, position) in [(8, self.start), (24, self.durable), (40, self.committed)] {
@@ -120,10 +127,13 @@ impl Checkpoint {
         bytes[56..64].copy_from_slice(&self.start_term.to_be_bytes());
         let checksum = crc32c(&bytes[..64]);
         bytes[64..].copy_from_slice(&checksum.to_be_bytes());
+        bytes
+    }
 
+    fn write_manifest(self, root: &Path, name: &str, sync: bool) -> io::Result<()> {
         let temporary = root.join(format!("{name}.tmp"));
         let mut file = File::create(&temporary)?;
-        file.write_all(&bytes)?;
+        file.write_all(&self.encode())?;
         if sync {
             file.sync_all()?;
         }
@@ -131,6 +141,83 @@ impl Checkpoint {
         if sync {
             File::open(root)?.sync_all()?;
         }
+        Ok(())
+    }
+}
+
+pub(crate) struct ProgressManifest {
+    file: File,
+    generation: u64,
+}
+
+impl ProgressManifest {
+    pub fn open(root: &Path) -> io::Result<Option<(Self, Checkpoint)>> {
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join(MANIFEST))
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        match file.metadata()?.len() {
+            len if len == CHECKPOINT_LEN as u64 => return Ok(None),
+            len if len == 2 * SLOT_STRIDE => {}
+            _ => return Err(corrupt("invalid progress manifest size")),
+        }
+        let mut latest = None;
+        for slot in 0..2 {
+            let mut record = [0; SLOT_LEN];
+            file.seek(SeekFrom::Start(slot * SLOT_STRIDE))?;
+            file.read_exact(&mut record)?;
+            let generation = u64::from_be_bytes(field(&record, 0));
+            if generation == 0
+                || generation % 2 != slot
+                || crc32c(&record[..SLOT_LEN - 4])
+                    != u32::from_be_bytes(field(&record, SLOT_LEN - 4))
+            {
+                continue;
+            }
+            let checkpoint = Checkpoint::decode(&field(&record, 8))?;
+            if latest.is_none_or(|(previous, _)| generation > previous) {
+                latest = Some((generation, checkpoint));
+            }
+        }
+        let (generation, checkpoint) =
+            latest.ok_or_else(|| corrupt("no valid progress manifest slot"))?;
+        Ok(Some((Self { file, generation }, checkpoint)))
+    }
+
+    pub fn create(root: &Path, checkpoint: Checkpoint) -> io::Result<Self> {
+        let temporary = root.join("manifest.tmp");
+        let file = File::create(&temporary)?;
+        file.set_len(2 * SLOT_STRIDE)?;
+        let mut manifest = Self {
+            file,
+            generation: 0,
+        };
+        manifest.save(checkpoint)?;
+        fs::rename(temporary, root.join(MANIFEST))?;
+        File::open(root)?.sync_all()?;
+        Ok(manifest)
+    }
+
+    pub fn save(&mut self, checkpoint: Checkpoint) -> io::Result<()> {
+        let generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| invalid("progress manifest generation exhausted"))?;
+        let mut record = [0; SLOT_LEN];
+        record[..8].copy_from_slice(&generation.to_be_bytes());
+        record[8..SLOT_LEN - 4].copy_from_slice(&checkpoint.encode());
+        let checksum = crc32c(&record[..SLOT_LEN - 4]);
+        record[SLOT_LEN - 4..].copy_from_slice(&checksum.to_be_bytes());
+        self.file
+            .seek(SeekFrom::Start((generation % 2) * SLOT_STRIDE))?;
+        self.file.write_all(&record)?;
+        self.file.sync_data()?;
+        self.generation = generation;
         Ok(())
     }
 }

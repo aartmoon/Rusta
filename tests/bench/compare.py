@@ -28,6 +28,7 @@ DATA = {
     "rusta": "/var/lib/rusta", "kafka": "/var/lib/kafka/data",
     "redpanda": "/var/lib/redpanda/data", "iggy": "/app/local_data", "nats": "/data",
 }
+WORKLOADS = {"write": 512, "mixed": 1024}
 
 
 @dataclass(frozen=True)
@@ -104,6 +105,10 @@ class Cluster:
             environment["RUSTA_INTERNAL_BIND"] = "0.0.0.0:29092"
             environment["RUSTA_INTERNAL_ADVERTISED"] = f"{node}:29092"
             if rf > 1:
+                if self.options.rusta_group_commit_us:
+                    environment["RUSTA_DURABLE_GROUP_COMMIT_US"] = str(self.options.rusta_group_commit_us)
+                if self.options.rusta_ack_profile:
+                    environment["RUSTA_ACK_PROFILE"] = "1"
                 environment.update({
                     "RUSTA_NODE_ID": str(i), "RUSTA_CLUSTER_ID": self.cluster_id,
                     "RUSTA_CLUSTER_CERTS": "/etc/rusta/pki",
@@ -138,6 +143,8 @@ class Cluster:
             port = 9092
         elif broker == "redpanda":
             argv = ["redpanda", "start", "--overprovisioned", "--check=false",
+                    "--unsafe-bypass-fsync=false", "--set", "redpanda.developer_mode=false",
+                    "--set", "redpanda.write_caching_default=false",
                     "--smp", "1", "--memory", "512M", "--reserve-memory", "0M",
                     "--kafka-addr", "internal://0.0.0.0:29092,external://0.0.0.0:9092",
                     "--advertise-kafka-addr", f"internal://{node}:29092,external://127.0.0.1:{host_port}",
@@ -209,12 +216,18 @@ class Cluster:
                            capture_output=True)
             filesystem, process = probe.stdout.strip().splitlines()
             nodes[name] = {"filesystem": filesystem, "pid1": process}
+            if self.profile.broker == "redpanda":
+                argv = docker("exec", cid, "cat", "/proc/1/cmdline", capture_output=True).stdout.split("\0")
+                if "--unsafe-bypass-fsync=false" not in argv or "--unsafe-bypass-fsync=true" in argv:
+                    raise RuntimeError(f"Redpanda {name} did not start with fsync enabled")
+                nodes[name]["unsafe_bypass_fsync"] = False
         return nodes
 
     def close(self):
         for name, cid in self.nodes.items():
             with (self.output / f"{name}.log").open("w") as log:
-                sp.run(["docker", "logs", "--tail", "500", cid], stdout=log, stderr=sp.STDOUT)
+                tail = [] if self.profile.broker == "rusta" and self.options.rusta_ack_profile else ["--tail", "500"]
+                sp.run(["docker", "logs", *tail, cid], stdout=log, stderr=sp.STDOUT)
             sp.run(["docker", "rm", "-fv", cid], stdout=sp.DEVNULL)
         for volume in self.volumes:
             sp.run(["docker", "volume", "rm", volume], stdout=sp.DEVNULL)
@@ -222,17 +235,22 @@ class Cluster:
             sp.run(["docker", "network", "rm", self.project], stdout=sp.DEVNULL)
 
 
-def scenario(cluster, output, topic, workload, size, partitions=6, options=None):
-    settings = options or cluster.options
+def prepare_topic(cluster, topic, partitions, settings):
     broker = cluster.profile.broker
-    native = broker in ("nats", "iggy")
     overrides = "-"
     if broker == "kafka" and cluster.profile.policy == "flush":
         overrides = "flush.messages=1"
-    if broker == "redpanda" and cluster.profile.policy == "cache":
-        overrides = "write.caching=true"
-    if not native and size:
-        command(java(settings.output, "prepare", cluster.bootstrap, topic, cluster.profile.rf, partitions, overrides))
+    if broker == "redpanda":
+        overrides = "write.caching=true" if cluster.profile.policy == "cache" else "write.caching=false"
+    command(java(settings.output, "prepare", cluster.bootstrap, topic, cluster.profile.rf, partitions, overrides))
+
+
+def scenario(cluster, output, topic, workload, size, partitions=6, options=None, prepared=False):
+    settings = options or cluster.options
+    broker = cluster.profile.broker
+    native = broker in ("nats", "iggy")
+    if not native and size and not prepared:
+        prepare_topic(cluster, topic, partitions, settings)
 
     def client(stage):
         arguments = [cluster.bootstrap, topic, size, settings.rate, settings.seconds, stage]
@@ -258,9 +276,11 @@ def shapes(cluster, output, options):
     first = scenario(cluster, output, "shape-one", "mixed", 4096, partitions=1)
     split = copy(options)
     split.rate = max(1, options.rate // 2)
+    for i in (1, 2):
+        prepare_topic(cluster, f"shape-pair-{i}", 3, split)
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         tasks = [
-            pool.submit(scenario, cluster, output, f"shape-pair-{i}", "mixed", 4096, 3, split)
+            pool.submit(scenario, cluster, output, f"shape-pair-{i}", "mixed", 4096, 3, split, True)
             for i in (1, 2)
         ]
         pair = [task.result() for task in tasks]
@@ -275,9 +295,15 @@ def main():
     parser.add_argument("output", type=Path)
     parser.add_argument("--profiles", nargs="+", choices=PROFILES, default=list(PROFILES))
     parser.add_argument("--rusta-image", default=IMAGES["rusta"])
+    parser.add_argument("--rusta-group-commit-us", type=int, default=0,
+                        metavar="0..2000", help="batching wait under load for Rusta durable")
+    parser.add_argument("--rusta-ack-profile", action="store_true",
+                        help="record Rusta RF3 ACK stage histograms in broker logs")
     parser.add_argument("--repeat", type=int, default=2)
     parser.add_argument("--seconds", type=int, default=8)
     parser.add_argument("--rate", type=int, default=2000)
+    parser.add_argument("--partitions", type=int, default=6)
+    parser.add_argument("--workloads", nargs="+", choices=WORKLOADS, default=list(WORKLOADS))
     parser.add_argument("--base-port", type=int, default=19592)
     parser.add_argument("--memory", default="1g")
     parser.add_argument("--subnet", help="optional dedicated Docker bridge subnet")
@@ -287,8 +313,11 @@ def main():
     parser.add_argument("--shape-matrix", action="store_true",
                         help="also exercise single-partition and concurrent 4 KiB workloads on Rusta")
     options = parser.parse_args()
-    if options.repeat < 1 or options.seconds < 4 or options.rate < 1 or not 1024 <= options.base_port <= 65533:
-        parser.error("choose positive repetitions and rate, at least four seconds and three unprivileged ports")
+    if not 0 <= options.rusta_group_commit_us <= 2000:
+        parser.error("Rusta group commit window must be between 0 and 2000 microseconds")
+    if (min(options.repeat, options.rate, options.partitions) < 1 or options.seconds < 4
+            or not 1024 <= options.base_port <= 65533):
+        parser.error("choose positive repetitions, rate and partition count, at least four seconds and three unprivileged ports")
     options.output = options.output.resolve()
     options.output.mkdir()
     command(["mvn", "-B", "-q", "-f", str(root / "tests/java/pom.xml"),
@@ -305,7 +334,11 @@ def main():
         "dirty_worktree": bool(command(["git", "status", "--porcelain"], cwd=root, capture_output=True).stdout.strip()),
         "memory_limit_per_broker": options.memory, "cpu_quota_per_broker": 1,
         "rate": options.rate, "warmup_seconds": 4, "seconds": options.seconds,
+        "partitions": options.partitions,
+        "workloads": options.workloads,
         "repetitions": options.repeat, "linger_ms": options.linger_ms,
+        "rusta_ack_profile": options.rusta_ack_profile,
+        "rusta_group_commit_us": options.rusta_group_commit_us,
         "fetch_max_wait_ms": options.fetch_max_wait_ms,
     }
     (options.output / "environment.json").write_text(json.dumps(metadata, indent=2) + "\n")
@@ -327,8 +360,9 @@ def main():
             result["nodes"] = cluster.describe()
             result["samples"].append(scenario(cluster, report, "idle", "idle", 0))
             for rep in range(1, options.repeat + 1):
-                for case, payload in (("write", 512), ("mixed", 1024)):
-                    result["samples"].append(scenario(cluster, report, f"{case}-{rep}", case, payload))
+                for case in options.workloads:
+                    result["samples"].append(scenario(cluster, report, f"{case}-{rep}", case,
+                                                      WORKLOADS[case], options.partitions))
             if options.shape_matrix and profile.broker == "rusta":
                 result["shapes"] = shapes(cluster, report, options)
         except (RuntimeError, ValueError, sp.SubprocessError) as error:

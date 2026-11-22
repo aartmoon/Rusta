@@ -8,6 +8,41 @@ use std::time::{Duration, Instant};
 use rusta_log::{Options, PartitionLog, Position, Retention};
 
 #[test]
+fn durable_raft_manifest_upgrades_and_recovers_from_a_torn_slot() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let opts = Options {
+        segment_bytes: 120,
+        ..Options::default()
+    };
+    let mut old = PartitionLog::open(dir.path(), opts)?;
+    old.append_batch(1, 100, &batch(&[(100, 1)]))?;
+    let initial = old.commit()?;
+    drop(old);
+
+    let mut log = PartitionLog::open_raft_durable(dir.path(), opts)?;
+    assert_eq!(log.committed(), initial);
+    log.append_batch(1, 101, &batch(&[(101, 2)]))?;
+    let confirmed = log.commit()?;
+    log.append_batch(1, 102, &batch(&[(102, 3)]))?;
+    drop(log);
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("manifest"))?;
+    // The next update would overwrite slot 1. Leave a generation without its checksum.
+    file.seek(SeekFrom::Start(64 * 1024))?;
+    file.write_all(&3_u64.to_be_bytes())?;
+    file.sync_data()?;
+    drop(file);
+    let log = PartitionLog::open_raft_durable(dir.path(), opts)?;
+    assert_eq!(log.committed(), confirmed);
+    assert_eq!(log.end(), confirmed);
+    assert!(log.batch_at(0, &mut Vec::new())?.is_some());
+    assert!(log.batch_at(1, &mut Vec::new())?.is_some());
+    Ok(())
+}
+
+#[test]
 fn cached_progress_survives_process_reopen_and_can_be_flushed() -> io::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut log = PartitionLog::open(dir.path(), Options::default())?;
@@ -127,29 +162,47 @@ fn restart_at_snapshot_boundary_ignores_obsolete_segments() -> io::Result<()> {
 fn full_disk_preserves_the_committed_prefix() -> io::Result<()> {
     let filesystem = std::env::var_os("RUSTA_TEST_FULL_DISK_DIR")
         .expect("set RUSTA_TEST_FULL_DISK_DIR to a dedicated tmpfs");
+    test_full_disk(&filesystem, |root| {
+        PartitionLog::open(root, Options::default())
+    })?;
+    test_full_disk(&filesystem, |root| {
+        PartitionLog::open_raft_durable(root, Options::default())
+    })?;
+
     let dir = tempfile::tempdir_in(filesystem)?;
     let root = dir.path().join("partition");
-    let mut log = PartitionLog::open(&root, Options::default())?;
+    let mut log = PartitionLog::open_raft_durable(&root, Options::default())?;
+    let confirmed = log.committed();
+    log.append_batch(1, 100, &batch(&[(100, 1)]))?;
+    let fill_path = dir.path().join("fill");
+    fill_filesystem(&fill_path)?;
+    // The next checkpoint has to allocate space for the other slot.
+    assert_eq!(log.commit().unwrap_err().kind(), ErrorKind::StorageFull);
+    drop(log);
+    fs::remove_file(fill_path)?;
+    let log = PartitionLog::open_raft_durable(&root, Options::default())?;
+    assert_eq!(log.committed(), confirmed);
+    assert_eq!(log.end(), confirmed);
+    Ok(())
+}
+
+fn test_full_disk(
+    filesystem: impl AsRef<Path>,
+    open: impl Fn(&Path) -> io::Result<PartitionLog>,
+) -> io::Result<()> {
+    let dir = tempfile::tempdir_in(filesystem)?;
+    let root = dir.path().join("partition");
+    let mut log = open(&root)?;
     log.append_batch(1, 100, &batch(&[(100, 1)]))?;
     let committed = log.commit()?;
     let fill_path = dir.path().join("fill");
-    let mut filler = fs::File::create(&fill_path)?;
-    let mut exhausted = false;
-    for _ in 0..16_384 {
-        if let Err(error) = filler.write_all(&[0; 4096]) {
-            assert_eq!(error.kind(), ErrorKind::StorageFull);
-            exhausted = true;
-            break;
-        }
-    }
-    assert!(exhausted, "test filesystem exceeded its 64 MiB budget");
+    fill_filesystem(&fill_path)?;
     let error = log.append_internal(1, 0, &[0; 8192]).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::StorageFull);
     drop(log);
-    drop(filler);
     fs::remove_file(fill_path)?;
 
-    let mut log = PartitionLog::open(&root, Options::default())?;
+    let mut log = open(&root)?;
     assert_eq!(log.committed(), committed);
     assert_eq!(log.durable(), committed);
     assert_eq!(log.end(), committed);
@@ -160,6 +213,17 @@ fn full_disk_preserves_the_committed_prefix() -> io::Result<()> {
     );
     assert_eq!(log.commit()?, position(3, 2));
     Ok(())
+}
+
+fn fill_filesystem(path: &Path) -> io::Result<()> {
+    let mut filler = fs::File::create(path)?;
+    for _ in 0..16_384 {
+        if let Err(error) = filler.write_all(&[0; 4096]) {
+            assert_eq!(error.kind(), ErrorKind::StorageFull);
+            return Ok(());
+        }
+    }
+    panic!("test filesystem exceeded its 64 MiB budget");
 }
 
 fn file(root: &Path, first_index: u64) -> std::path::PathBuf {
