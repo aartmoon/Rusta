@@ -222,6 +222,25 @@ impl Disk {
         Ok(log)
     }
 
+    pub fn can_apply_cached_data(&self, last_index: u64) -> bool {
+        const INLINE_APPLY_BYTES: usize = 64 * 1024;
+        self.log.has_durable_raft_manifest()
+            && self.membership.voters.len() >= 3
+            && self.membership.voters_outgoing.is_empty()
+            && last_index + 1 - self.checkpoint_next_index < CHECKPOINT_INTERVAL
+            && self.log.has_cached_term(last_index)
+            && self.log.has_cached_data_suffix(INLINE_APPLY_BYTES)
+    }
+
+    pub fn can_defer_commit(&self, committed: &[Entry]) -> bool {
+        self.log.has_durable_raft_manifest()
+            && self.membership.voters.len() >= 3
+            && committed.iter().all(|entry| {
+                entry.get_entry_type() == EntryType::EntryNormal
+                    && entry.data.first() == Some(&TIMESTAMPED_BATCH)
+            })
+    }
+
     pub fn persist(
         &mut self,
         election: Option<&HardState>,
@@ -473,11 +492,12 @@ impl Disk {
         Ok(())
     }
 
-    pub fn checkpoint_if_due(&mut self) {
+    pub fn checkpoint_if_due(&mut self) -> Result<()> {
         let next = self.log.committed().next_index;
         if self.internal_entries || next - self.checkpoint_next_index < CHECKPOINT_INTERVAL {
-            return;
+            return Ok(());
         }
+        self.log.sync_raft_progress()?;
         match DataCheckpoint::save(
             &self.root,
             &self.log,
@@ -492,6 +512,7 @@ impl Disk {
                 eprintln!("checkpoint {}: {error:#}", self.root.display());
             }
         }
+        Ok(())
     }
 }
 

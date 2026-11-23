@@ -11,7 +11,7 @@ use anyhow::{Context, Result, ensure};
 use bytes::{BufMut, Bytes, BytesMut};
 use protobuf::Message as ProtoMessage;
 use raft::{
-    Config, RawNode, SnapshotStatus, StateRole,
+    Config, ProgressState, RawNode, SnapshotStatus, StateRole,
     eraftpb::{ConfChange, ConfChangeType, EntryType, Message, MessageType},
 };
 use rusta_kafka::records::Batch;
@@ -30,7 +30,7 @@ use super::{
     Peer, Settings, ack_profile,
     disk::{Disk, decode_change, encode_batch, encode_retention, replace},
     producers,
-    transport::{Packet, Queued, Senders},
+    transport::{Packet, PeerQueue, Queued, Senders, merge_appends},
 };
 
 #[path = "migration.rs"]
@@ -57,7 +57,8 @@ pub const CONTROL: GroupId = GroupId {
 };
 
 const GROUP_SHARDS: usize = 4;
-const MAX_PENDING_BATCHES: usize = 4;
+const MAX_PENDING_BATCHES: usize = 16;
+const MAX_PENDING_PER_PRODUCER: usize = 4;
 const MAX_UNCOMMITTED_BYTES: usize = 2 * MAX_BATCH;
 const PAGE_CACHE_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -75,7 +76,7 @@ pub fn coordinator(id: &str) -> GroupId {
     group_shard((hash % GROUP_SHARDS as u64) as usize)
 }
 
-fn is_group_shard(key: GroupId) -> bool {
+pub(super) fn is_group_shard(key: GroupId) -> bool {
     key.topic.is_nil() && (1..=GROUP_SHARDS as u32).contains(&key.partition)
 }
 
@@ -194,6 +195,7 @@ struct Pending {
     bytes: usize,
     proposed_at: Option<Instant>,
     persisted_at: Option<Instant>,
+    first_append_at: Option<Instant>,
 }
 
 struct Read {
@@ -1185,6 +1187,16 @@ impl Engine {
                 .pending
                 .iter()
                 .filter_map(|pending| pending.batch.map(|batch| (batch, pending.offset)));
+            // Keep retries within the committed producer history even when
+            // several producers share the partition's larger proposal window.
+            if staged
+                .clone()
+                .filter(|(pending, _)| pending.producer == batch.producer)
+                .count()
+                >= MAX_PENDING_PER_PRODUCER
+            {
+                return Ok(Err(Error::RequestTimedOut));
+            }
             match node.raw.store().producers.check_staged(batch, staged) {
                 Ok(None) => {}
                 Ok(Some(offset)) => {
@@ -1393,7 +1405,7 @@ impl Engine {
         Ok(())
     }
 
-    pub fn add_peer(&mut self, id: u64, peer: Peer, sender: tokio::sync::mpsc::Sender<Queued>) {
+    pub fn add_peer(&mut self, id: u64, peer: Peer, sender: PeerQueue) {
         Arc::make_mut(&mut self.outbound).insert(id, sender);
         self.settings.peers.insert(id, peer);
     }
@@ -1504,17 +1516,12 @@ impl Engine {
 
     #[cfg(test)]
     pub fn tick(&mut self) -> Result<()> {
-        self.tick_groups(false).map(|_| ())
+        self.tick_groups()
     }
 
-    pub(super) fn tick_groups(&mut self, independent: bool) -> Result<Vec<GroupId>> {
-        let mut data = Vec::new();
+    pub(super) fn tick_groups(&mut self) -> Result<()> {
         let keys: Vec<_> = self.nodes.keys().copied().collect();
         for key in keys {
-            if independent && self.independent_partition(key) {
-                data.push(key);
-                continue;
-            }
             if let Some(node) = self.nodes.get_mut(&key) {
                 Self::tick_node(node);
                 self.drain(key)?;
@@ -1542,7 +1549,49 @@ impl Engine {
                 node.cache_flushed_at = Some(Instant::now());
             }
         }
-        if self.last_report.elapsed() >= Duration::from_millis(250) {
+        self.maintain_topology()
+    }
+
+    // Internal group shards do not apply catalog events. Control Ready and
+    // maintenance still run under the topology fence.
+    pub(super) fn tick_durable(&mut self) -> Result<bool> {
+        let control = self.nodes.get_mut(&CONTROL).expect("control group");
+        Self::tick_node(control);
+        let control_ready = control.raw.has_ready();
+        for partition in 0..GROUP_SHARDS {
+            let key = group_shard(partition);
+            if let Some(node) = self.nodes.get_mut(&key) {
+                Self::tick_node(node);
+                self.drain(key)?;
+                let term = self.nodes[&key].raw.raft.term;
+                let _ = self.with_group(key, term, |groups, _| groups.maintain(true))?;
+            }
+        }
+        Ok(control_ready || self.maintenance_due())
+    }
+
+    pub(super) fn data_tick_keys(&self) -> impl Iterator<Item = GroupId> + '_ {
+        // A leased partition is temporarily absent from nodes.
+        self.replicas.iter().filter_map(|(&key, replicas)| {
+            (!key.topic.is_nil()
+                && (replicas.contains(&self.settings.id) || self.nodes.contains_key(&key)))
+            .then_some(key)
+        })
+    }
+
+    fn maintenance_due(&self) -> bool {
+        self.last_report.elapsed() >= Duration::from_millis(250)
+    }
+
+    pub(super) fn tick_durable_fenced(&mut self) -> Result<()> {
+        if self.nodes[&CONTROL].raw.has_ready() {
+            self.drain(CONTROL)?;
+        }
+        self.maintain_topology()
+    }
+
+    fn maintain_topology(&mut self) -> Result<()> {
+        if self.maintenance_due() {
             self.last_report = Instant::now();
             self.drive_cache_recovery()?;
             let requested = self
@@ -1602,7 +1651,7 @@ impl Engine {
                 }
             }
         }
-        Ok(data)
+        Ok(())
     }
 
     fn tick_node(node: &mut Node) {
@@ -1854,9 +1903,30 @@ impl Engine {
                             && context.outbound.contains_key(&message.to)
                     })
                     .count();
-                for message in messages.drain(..early) {
-                    let queue = &context.outbound[&message.to];
-                    Queued::send(queue, context.send_bytes, Packet::Raft(key, message));
+                let mut appends: BTreeMap<u64, Message> = BTreeMap::new();
+                for mut message in messages.drain(..early) {
+                    let peer = message.to;
+                    if let Some(previous) = appends.get_mut(&peer)
+                        && merge_appends(previous, &mut message)
+                    {
+                        continue;
+                    }
+                    if let Some(previous) = appends.insert(peer, message) {
+                        node.observe_append(&previous);
+                        Queued::send(
+                            &context.outbound[&peer],
+                            context.send_bytes,
+                            Packet::Raft(key, previous),
+                        );
+                    }
+                }
+                for (peer, message) in appends {
+                    node.observe_append(&message);
+                    Queued::send(
+                        &context.outbound[&peer],
+                        context.send_bytes,
+                        Packet::Raft(key, message),
+                    );
                 }
             }
             let snapshot = (!ready.snapshot().is_empty()).then_some(ready.snapshot());
@@ -1880,11 +1950,21 @@ impl Engine {
                 .committed_entries()
                 .last()
                 .map(|entry| entry.index + 1);
+            // Piggyback a data-only commit on the next append manifest.
+            // Election, membership and internal records still checkpoint synchronously.
+            let checkpoint = if ready.entries().is_empty()
+                && relocation.is_none()
+                && node.raw.store().can_defer_commit(ready.committed_entries())
+            {
+                None
+            } else {
+                committed
+            };
             let profiling = ack_profile::enabled() && !key.topic.is_nil();
             let ready_commit_at = (profiling && committed.is_some()).then(Instant::now);
             node.raw
                 .mut_store()
-                .persist(ready.hs(), ready.entries(), committed)?;
+                .persist(ready.hs(), ready.entries(), checkpoint)?;
             if profiling && let Some(first) = ready.entries().first() {
                 let last = ready.entries().last().expect("nonempty Ready entries");
                 let now = Instant::now();
@@ -1911,7 +1991,12 @@ impl Engine {
             }
 
             if let Some(last) = committed_entries.last() {
-                node.raw.mut_store().log.commit_through(last.index + 1)?;
+                let store = node.raw.mut_store();
+                if relocation.is_none() && store.can_defer_commit(&committed_entries) {
+                    store.log.publish_raft_commit(last.index + 1)?;
+                } else {
+                    store.log.commit_through(last.index + 1)?;
+                }
                 node.committed_term = last.term;
             }
             for entry in committed_entries {
@@ -1948,7 +2033,7 @@ impl Engine {
                 }
                 node.raw.advance_apply_to(entry.index);
             }
-            node.raw.mut_store().checkpoint_if_due();
+            node.raw.mut_store().checkpoint_if_due()?;
             for state in states {
                 if let Some(read) = node.reads.get_mut(&state.request_ctx) {
                     read.authorized = Some(state.index);
@@ -1971,6 +2056,7 @@ impl Engine {
                     continue; // Raft retransmits append entries after the next heartbeat.
                 }
                 if let Some(queue) = context.outbound.get(&message.to) {
+                    node.observe_append(&message);
                     Queued::send(queue, context.send_bytes, Packet::Raft(key, message));
                 }
             }
@@ -2087,6 +2173,16 @@ impl Engine {
                         committed.saturating_duration_since(persisted),
                     );
                 }
+                if let Some(append) = pending.first_append_at {
+                    ack_profile::record(
+                        "proposal_to_first_raft_append",
+                        append.saturating_duration_since(proposed),
+                    );
+                    ack_profile::record(
+                        "first_raft_append_to_commit",
+                        committed.saturating_duration_since(append),
+                    );
+                }
                 ack_profile::finish("commit_to_reply", Some(committed));
             }
             let result = if is_group_shard(key) && (!local_leader || pending.term != term) {
@@ -2126,6 +2222,13 @@ impl Engine {
                 .is_none_or(|movement| movement.key != key)
     }
 
+    pub(super) fn local_partition(&self, key: GroupId) -> Option<&Node> {
+        if self.closing || !self.independent_partition(key) {
+            return None;
+        }
+        self.nodes.get(&key)
+    }
+
     pub(super) fn lease_partition(&mut self, key: GroupId) -> Option<PartitionWork> {
         if !self.independent_partition(key) {
             return None;
@@ -2163,9 +2266,70 @@ impl Engine {
         }
     }
 
-    pub(super) fn tick_partition(&mut self, key: GroupId) -> Result<()> {
-        if let Some(node) = self.nodes.get_mut(&key) {
+    pub(super) fn step_inline_raft(&mut self, key: GroupId, message: &mut Message) -> Result<bool> {
+        if !self.independent_partition(key) || self.retired.contains(&message.from) {
+            return Ok(false);
+        }
+        let Some(node) = self.nodes.get_mut(&key) else {
+            return Ok(false);
+        };
+        let raft = &node.raw.raft;
+        if message.term != raft.term || node.raw.has_ready() {
+            return Ok(false);
+        }
+        let in_memory = match message.get_msg_type() {
+            // Follower heartbeats are memory-only when they don't advance commit.
+            MessageType::MsgHeartbeat => {
+                raft.state == StateRole::Follower
+                    && message.from == node.leader()
+                    && message.commit <= raft.raft_log.committed
+            }
+            // A caught-up peer's response can authorize ReadIndex without sending
+            // another append or loading a snapshot from the log.
+            MessageType::MsgHeartbeatResponse => {
+                raft.state == StateRole::Leader
+                    && raft.prs().get(message.from).is_some_and(|peer| {
+                        peer.matched == raft.raft_log.last_index()
+                            && peer.pending_request_snapshot == raft::INVALID_INDEX
+                    })
+            }
+            // A response through the end of a fully cached, durable suffix
+            // can advance quorum commit without producing any writes.
+            MessageType::MsgAppendResponse => {
+                let last = raft.raft_log.last_index();
+                raft.state == StateRole::Leader
+                    && !message.reject
+                    && message.index == last
+                    && !raft.should_bcast_commit()
+                    && raft.prs().get(message.from).is_some_and(|peer| {
+                        peer.state == ProgressState::Replicate
+                            && peer.pending_request_snapshot == raft::INVALID_INDEX
+                    })
+                    && node.raw.store().can_apply_cached_data(last)
+            }
+            _ => false,
+        };
+        if !in_memory {
+            return Ok(false);
+        }
+        let _ = node.raw.step(std::mem::take(message));
+        self.drain(key)?;
+        Ok(true)
+    }
+
+    pub(super) fn tick_partition_clock(&mut self, key: GroupId) -> bool {
+        self.nodes.get_mut(&key).is_some_and(|node| {
             Self::tick_node(node);
+            node.raw.has_ready()
+        })
+    }
+
+    pub(super) fn drain_partition_ready(&mut self, key: GroupId) -> Result<()> {
+        if self
+            .nodes
+            .get(&key)
+            .is_some_and(|node| node.raw.has_ready())
+        {
             self.drain(key)?;
         }
         Ok(())
@@ -2204,26 +2368,31 @@ impl PartitionWork {
         Ok(result)
     }
 
-    pub(super) fn receive(&mut self, message: Message) -> Result<()> {
+    pub(super) fn step(&mut self, message: Message) -> Result<()> {
         if self.retired.contains(&message.from) {
             return Ok(());
         }
-        // Snapshots retain the topology and recovery validation of Engine::receive.
+        // Snapshots and cache recovery use Engine::receive with topology validation.
         ensure!(
-            message.get_msg_type() != MessageType::MsgSnapshot,
-            "snapshot routed to detached worker"
+            message.get_msg_type() != MessageType::MsgSnapshot && !self.node.recovering,
+            "snapshot or recovery routed to detached worker"
         );
-        if !self.node.recovering || self.node.accepts_recovery_append(&message) {
-            let _ = self.node.raw.step(message);
+        let _ = self.node.raw.step(message);
+        Ok(())
+    }
+
+    pub(super) fn drain_raft(&mut self) -> Result<()> {
+        if self.node.raw.has_ready() {
             self.drain()?;
-            self.node.check_recovery_progress();
         }
         Ok(())
     }
 
-    pub(super) fn tick(&mut self) -> Result<()> {
-        Engine::tick_node(&mut self.node);
-        self.drain()
+    pub(super) fn tick_ready(&mut self, clock: bool) -> Result<()> {
+        if clock {
+            Engine::tick_node(&mut self.node);
+        }
+        self.drain_raft()
     }
 
     fn drain(&mut self) -> Result<()> {
@@ -2402,7 +2571,7 @@ impl Node {
             // heartbeat. This lets them publish append and commit in one manifest sync.
             skip_bcast_commit: !cache && !key.topic.is_nil(),
             max_size_per_msg: MAX_BATCH as u64 + 4096,
-            max_inflight_msgs: 4,
+            max_inflight_msgs: if !cache && !key.topic.is_nil() { 8 } else { 4 },
             max_committed_size_per_ready: 2 * MAX_BATCH as u64,
             max_uncommitted_size: MAX_UNCOMMITTED_BYTES as u64,
             ..Config::default()
@@ -2426,6 +2595,10 @@ impl Node {
             recovery_offer: None,
             recovery_requests: HashMap::new(),
         })
+    }
+
+    pub(super) fn can_stage_read_in_memory(&self) -> bool {
+        !self.raw.has_ready() && self.log().has_cached_term(self.raw.raft.raft_log.committed)
     }
 
     pub fn leader(&self) -> u64 {
@@ -2504,6 +2677,26 @@ impl Node {
         self.propose_entry(bytes, offset, None)
     }
 
+    fn observe_append(&mut self, message: &Message) {
+        if !ack_profile::enabled() || message.get_msg_type() != MessageType::MsgAppend {
+            return;
+        }
+        let (Some(first), Some(last)) = (message.entries.first(), message.entries.last()) else {
+            return;
+        };
+        let now = Instant::now();
+        for pending in self
+            .pending
+            .iter_mut()
+            .rev()
+            .take_while(|pending| pending.index >= first.index)
+        {
+            if pending.index <= last.index && pending.proposed_at.is_some() {
+                pending.first_append_at.get_or_insert(now);
+            }
+        }
+    }
+
     fn propose_entry(
         &mut self,
         bytes: Vec<u8>,
@@ -2525,6 +2718,7 @@ impl Node {
             bytes: length,
             proposed_at,
             persisted_at: None,
+            first_append_at: None,
         });
         Ok(receiver)
     }
@@ -2591,25 +2785,7 @@ mod tests {
             )?
             .expect("topic proposed");
         cluster.pump()?;
-        let mut leader = None;
-        for _ in 0..150 {
-            for broker in cluster.brokers.iter_mut().flatten() {
-                broker.tick()?;
-            }
-            cluster.pump()?;
-            leader = cluster.brokers.iter().position(|broker| {
-                broker
-                    .as_ref()
-                    .unwrap()
-                    .nodes
-                    .get(&key)
-                    .is_some_and(Node::admitting)
-            });
-            if leader.is_some() {
-                break;
-            }
-        }
-        let leader = leader.expect("partition leader elected");
+        let leader = cluster.partition_leader(key)?;
         let make_batch = |sequence: i32| {
             let mut batch = vec![0u8; 61];
             batch.extend_from_slice(&[12, 0, 0, 0, 1, 1, 0]);
@@ -2637,7 +2813,7 @@ mod tests {
             broker.produce(key, make_batch(0))?,
             Err(Error::RequestTimedOut)
         ));
-        for sequence in 2..MAX_PENDING_BATCHES as i32 {
+        for sequence in 2..MAX_PENDING_PER_PRODUCER as i32 {
             let Write::Pending(mut reply) = broker.produce(key, make_batch(sequence))?.unwrap()
             else {
                 panic!("new batch must be proposed");
@@ -2646,7 +2822,7 @@ mod tests {
             replies.push(reply);
         }
         assert!(matches!(
-            broker.produce(key, make_batch(MAX_PENDING_BATCHES as i32))?,
+            broker.produce(key, make_batch(MAX_PENDING_PER_PRODUCER as i32))?,
             Err(Error::RequestTimedOut)
         ));
         assert_eq!(broker.nodes[&key].log().committed().next_offset, 0);
@@ -2654,7 +2830,7 @@ mod tests {
         for (offset, reply) in replies.iter_mut().enumerate() {
             assert_eq!(reply.try_recv()?.unwrap(), offset as i64);
         }
-        let end = MAX_PENDING_BATCHES as i64;
+        let end = MAX_PENDING_PER_PRODUCER as i64;
         assert!(cluster.brokers.iter().enumerate().any(|(index, broker)| {
             index != leader
                 && broker.as_ref().unwrap().nodes[&key]
@@ -2672,6 +2848,22 @@ mod tests {
         for broker in cluster.brokers.iter().flatten() {
             assert_eq!(broker.nodes[&key].log().committed().next_offset, end);
         }
+        // Lose every live commit index at once. The persisted voting majority
+        // still contains the ACKed entries, even with older commit checkpoints.
+        cluster.restart_all()?;
+        assert!(cluster.brokers.iter().flatten().any(|broker| {
+            let log = broker.nodes[&key].log();
+            log.durable().next_offset == end && log.committed().next_offset < end
+        }));
+        let leader = cluster.partition_leader(key)?;
+        assert_eq!(
+            cluster.brokers[leader].as_ref().unwrap().nodes[&key]
+                .log()
+                .committed()
+                .next_offset,
+            end
+        );
+
         let broker = cluster.brokers[leader].as_mut().unwrap();
         let Write::Existing(offset, mut barrier) = broker.produce(key, make_batch(0))?.unwrap()
         else {
@@ -2683,7 +2875,7 @@ mod tests {
 
         let broker = cluster.brokers[leader].as_mut().unwrap();
         let mut unconfirmed = Vec::new();
-        for sequence in MAX_PENDING_BATCHES..MAX_PENDING_BATCHES + 2 {
+        for sequence in MAX_PENDING_PER_PRODUCER..MAX_PENDING_PER_PRODUCER + 2 {
             let Write::Pending(reply) = broker.produce(key, make_batch(sequence as i32))?.unwrap()
             else {
                 panic!("new batch must be proposed");
@@ -2703,7 +2895,7 @@ mod tests {
         }
         assert_eq!(
             broker.nodes[&key].log().committed().next_offset,
-            MAX_PENDING_BATCHES as i64
+            MAX_PENDING_PER_PRODUCER as i64
         );
         Ok(())
     }
@@ -2713,7 +2905,7 @@ mod tests {
     struct TestCluster {
         brokers: Vec<Option<Engine>>,
         routes: Vec<Outbound>,
-        _root: tempfile::TempDir,
+        root: tempfile::TempDir,
     }
 
     impl TestCluster {
@@ -2756,7 +2948,7 @@ mod tests {
                     .filter(|&peer| peer != id)
                     .map(|peer| {
                         let (sender, receiver) = tokio::sync::mpsc::channel(16);
-                        ((peer, sender), (peer, receiver))
+                        ((peer, PeerQueue::single(sender)), (peer, receiver))
                     })
                     .unzip();
                 brokers.push(Some(Engine::open(
@@ -2767,10 +2959,49 @@ mod tests {
                 routes.push(receivers);
             }
             Ok(Self {
-                _root: root,
+                root,
                 brokers,
                 routes,
             })
+        }
+
+        fn restart_all(&mut self) -> Result<()> {
+            let stopped: Vec<_> = self
+                .brokers
+                .iter_mut()
+                .map(|broker| {
+                    let engine = broker.take().expect("broker is running");
+                    (engine.settings.clone(), engine.outbound.as_ref().clone())
+                })
+                .collect();
+            for route in &mut self.routes {
+                for receiver in route.values_mut() {
+                    while receiver.try_recv().is_ok() {}
+                }
+            }
+            for (broker, (settings, senders)) in self.brokers.iter_mut().zip(stopped) {
+                let data = self.root.path().join(settings.id.to_string());
+                *broker = Some(Engine::open(settings, &data, senders)?);
+            }
+            Ok(())
+        }
+
+        fn partition_leader(&mut self, key: GroupId) -> Result<usize> {
+            for _ in 0..150 {
+                for broker in self.brokers.iter_mut().flatten() {
+                    broker.tick()?;
+                }
+                self.pump()?;
+                if let Some(index) = self.brokers.iter().position(|broker| {
+                    broker
+                        .as_ref()
+                        .and_then(|broker| broker.nodes.get(&key))
+                        .is_some_and(Node::admitting)
+                }) {
+                    return Ok(index);
+                }
+            }
+            anyhow::bail!("no elected data leader")
         }
 
         fn pump(&mut self) -> Result<()> {
@@ -2794,8 +3025,10 @@ mod tests {
                 if packets.is_empty() {
                     return Ok(());
                 }
-                for (dest, key, message) in packets {
-                    if let Some(broker) = &mut self.brokers[dest] {
+                for (dest, key, mut message) in packets {
+                    if let Some(broker) = &mut self.brokers[dest]
+                        && !broker.step_inline_raft(key, &mut message)?
+                    {
                         broker.receive(key, message)?;
                     }
                     if stop(self) {

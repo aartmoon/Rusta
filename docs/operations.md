@@ -28,6 +28,7 @@ For a cluster, generate and mount [peer certificates](../README.md#run-a-local-c
 | `RUSTA_GROUP_OFFSET_RETENTION_MS` | 604800000 ms after a group empties. The singleton profile passes it through. Add it to the broker service environment to tune it in a cluster. |
 | `RUSTA_CLUSTER_SNAPSHOT_INTERVAL` | 4096 Raft entries between snapshots. Use a positive integer. |
 | `RUSTA_CLUSTER_ACK_MODE` | `auto` by default. It keeps an existing volume's mode and enables `page-cache` on fresh Linux clusters with at least three bootstrap voters. Set `durable` explicitly when creating a cluster that must sync a majority before every ACK. |
+| `RUSTA_DURABLE_DISK_WORKERS` | Maximum concurrent durable partition workers per broker, from 1 to 32. Defaults to 8. |
 | `RUSTA_CLUSTER_PRODUCER_RETENTION_MS` | 86400000 ms for inactive cluster producer histories. Configure a positive duration in the broker environment, consistently across peers. |
 | `RUSTA_DEBUG_CONNECTIONS` | Set to `1` temporarily to log Kafka connection errors. |
 

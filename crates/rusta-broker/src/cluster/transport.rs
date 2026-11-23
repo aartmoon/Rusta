@@ -6,12 +6,12 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use protobuf::Message as ProtoMessage;
 use raft::eraftpb::{Message, MessageType};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader as AsyncBufReader},
     net::{TcpListener, TcpStream},
     runtime::Handle,
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 use super::{
     Cluster, Peer, Settings, ack_profile,
-    engine::{GroupId, Movement},
+    engine::{GroupId, Movement, is_group_shard},
 };
 
 pub enum Packet {
@@ -57,7 +57,25 @@ impl Queued {
         self.packet
     }
 
-    pub fn send(queue: &mpsc::Sender<Self>, budget: &Arc<Semaphore>, packet: Packet) {
+    fn record_dequeue(&self) {
+        let Some(enqueued_at) = self.enqueued_at else {
+            return;
+        };
+        let stage = match &self.packet {
+            Packet::Raft(key, message) if !key.topic.is_nil() => match message.get_msg_type() {
+                MessageType::MsgAppend if !message.entries.is_empty() => {
+                    "raft_append_outbound_queue"
+                }
+                MessageType::MsgAppendResponse => "raft_response_outbound_queue",
+                _ => "raft_outbound_queue",
+            },
+            _ => "raft_outbound_queue",
+        };
+        ack_profile::record(stage, enqueued_at.elapsed());
+    }
+
+    pub fn send(queue: &PeerQueue, budget: &Arc<Semaphore>, packet: Packet) {
+        let queue = queue.sender(&packet);
         let size = match &packet {
             Packet::Raft(_, message) => message.compute_size() as usize + GROUP,
             Packet::Leaders(report) | Packet::PeerReady(report) => report.len(),
@@ -121,12 +139,41 @@ fn record_drop(stage: &'static str) {
     }
 }
 
-pub type Senders = HashMap<u64, mpsc::Sender<Queued>>;
+#[derive(Clone)]
+pub struct PeerQueue {
+    data: mpsc::Sender<Queued>,
+    internal: Option<mpsc::Sender<Queued>>,
+}
+
+impl PeerQueue {
+    #[cfg(test)]
+    pub(super) fn single(data: mpsc::Sender<Queued>) -> Self {
+        Self {
+            data,
+            internal: None,
+        }
+    }
+
+    fn sender(&self, packet: &Packet) -> &mpsc::Sender<Queued> {
+        if matches!(packet, Packet::Raft(key, _) if key.topic.is_nil())
+            && let Some(internal) = &self.internal
+        {
+            return internal;
+        }
+        &self.data
+    }
+}
+
+pub type Senders = HashMap<u64, PeerQueue>;
 type Pins = HashMap<u64, CertificateDer<'static>>;
 const MAX_PACKET: usize = 2 * 1024 * 1024 + 65536;
 // One timer turn can enqueue a heartbeat for each partition plus internal groups.
 // The shared byte budget still limits retention of large frames.
 const RAFT_SEND_QUEUE_SLOTS: usize = crate::catalog::MAX_PARTITIONS + 32;
+// The shared receive-byte semaphore also bounds the payloads handed to partition workers.
+const RAFT_RECEIVE_PIPELINE: usize = 32;
+const RAFT_WRITE_BATCH_BYTES: usize = 128 * 1024;
+const RAFT_WRITE_BATCH_FRAMES: usize = 32;
 const HEADER: usize = 49;
 const GROUP: usize = 20;
 const LEGACY_MOVE: usize = GROUP + 16;
@@ -139,6 +186,30 @@ const MAX_SNAPSHOT_FRAME: usize = super::checkpoint::MAX_SNAPSHOT as usize + 16 
 const SNAPSHOT_CHUNK: usize = 256 * 1024;
 const SNAPSHOT_RATE: f64 = (8 * 1024 * 1024) as f64;
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(15);
+
+// Raft frees all in-flight slots through the last acknowledged index.
+// A follower can persist contiguous appends from the same leader in one Ready.
+pub(super) fn merge_appends(previous: &mut Message, next: &mut Message) -> bool {
+    let Some(last) = previous.entries.last() else {
+        return false;
+    };
+    if next.entries.is_empty()
+        || previous.to != next.to
+        || previous.from != next.from
+        || previous.term != next.term
+        || next.index != last.index
+        || next.log_term != last.term
+        || previous.compute_size() as usize + next.compute_size() as usize + HEADER + GROUP
+            > MAX_PACKET
+    {
+        return false;
+    }
+    let mut entries = previous.take_entries().into_vec();
+    entries.extend(next.take_entries());
+    previous.set_entries(entries.into());
+    previous.commit = previous.commit.max(next.commit);
+    true
+}
 
 pub fn peer_fingerprint(pin: &CertificateDer<'static>, spec: &str) -> [u8; 32] {
     let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
@@ -248,6 +319,7 @@ pub struct Routes {
     accept: TlsAcceptor,
     identity: Arc<RwLock<Pins>>,
     capacity: Arc<Semaphore>,
+    streams_per_peer: usize,
     cluster: Uuid,
     voter_mask: [u8; 32],
     validators: Validators,
@@ -255,11 +327,13 @@ pub struct Routes {
 
 impl Routes {
     pub fn new(settings: &Settings, tls: Tls) -> Self {
+        let streams_per_peer = if settings.page_cache { 1 } else { 2 };
         Self {
             connect: tls.connect,
             accept: tls.accept,
             identity: Arc::new(RwLock::new(tls.identity)),
-            capacity: Arc::new(Semaphore::new(settings.peers.len() + 4)),
+            capacity: Arc::new(Semaphore::new(settings.peers.len() * streams_per_peer + 4)),
+            streams_per_peer,
             cluster: settings.cluster,
             voter_mask: settings.voter_mask(),
             validators: tls.validators,
@@ -306,12 +380,12 @@ impl Routes {
         peer: Peer,
         pinned: CertificateDer<'static>,
         runtime: &Handle,
-    ) -> mpsc::Sender<Queued> {
+    ) -> PeerQueue {
         self.identity
             .write()
             .expect("peer pins")
             .insert(id, pinned.clone());
-        self.capacity.add_permits(1);
+        self.capacity.add_permits(self.streams_per_peer);
         self.connect_peer(peer, pinned, runtime)
     }
 
@@ -320,17 +394,25 @@ impl Routes {
         peer: Peer,
         pinned: CertificateDer<'static>,
         runtime: &Handle,
-    ) -> mpsc::Sender<Queued> {
-        let (sender, messages) = mpsc::channel(RAFT_SEND_QUEUE_SLOTS);
-        runtime.spawn(outbound(
-            self.cluster,
-            self.voter_mask,
-            peer,
-            pinned,
-            self.connect.clone(),
-            messages,
-        ));
-        sender
+    ) -> PeerQueue {
+        let connect = |depth| {
+            let (sender, messages) = mpsc::channel(depth);
+            runtime.spawn(outbound(
+                self.cluster,
+                self.voter_mask,
+                peer.clone(),
+                pinned.clone(),
+                self.connect.clone(),
+                messages,
+            ));
+            sender
+        };
+        // Catalog and group Raft must make progress even when the socket
+        // carrying partition appends is applying receive backpressure.
+        PeerQueue {
+            data: connect(RAFT_SEND_QUEUE_SLOTS),
+            internal: (self.streams_per_peer > 1).then(|| connect(32)),
+        }
     }
 
     pub async fn listen(&self, settings: &Settings, cluster: Arc<Cluster>) -> Result<()> {
@@ -412,6 +494,45 @@ impl Remote {
         Ok((header, 4 + header_size))
     }
 
+    fn encode_frame(&self, frame: &mut Vec<u8>, packet: &Packet) -> Result<()> {
+        let (kind, group, data): (_, _, Bytes) = match packet {
+            Packet::Raft(key, message) => {
+                let (header, len) =
+                    self.frame_header(2, Some(*key), message.compute_size() as usize)?;
+                frame.extend_from_slice(&header[..len]);
+                message.write_to_vec(frame)?;
+                return Ok(());
+            }
+            Packet::Leaders(data) => (3, None, data.clone()),
+            Packet::Join => (4, None, Bytes::new()),
+            Packet::Drain => (5, None, Bytes::new()),
+            Packet::PeerReady(data) => (7, None, data.clone()),
+            Packet::RecoveryRequest(key, token) => {
+                (9, Some(*key), Bytes::copy_from_slice(token.as_bytes()))
+            }
+            Packet::RecoveryStart(key, token, term, committed) => {
+                let mut data = BytesMut::with_capacity(32);
+                data.extend_from_slice(token.as_bytes());
+                data.put_u64(*term);
+                data.put_u64(*committed);
+                (10, Some(*key), data.freeze())
+            }
+            Packet::Moved(id, movement) => {
+                let mut body = BytesMut::with_capacity(MOVE);
+                body.extend_from_slice(movement.key.topic.as_bytes());
+                body.put_u32(movement.key.partition);
+                body.put_u64(movement.from);
+                body.put_u64(movement.to);
+                body.extend_from_slice(id.as_bytes());
+                (6, None, body.freeze())
+            }
+        };
+        let (header, len) = self.frame_header(kind, group, data.len())?;
+        frame.extend_from_slice(&header[..len]);
+        frame.extend_from_slice(&data);
+        Ok(())
+    }
+
     async fn send_snapshot(&self, key: GroupId, message: &Message) -> Result<()> {
         let mut socket = self.connect().await?;
         let data = message.write_to_bytes()?;
@@ -443,8 +564,17 @@ async fn outbound(
     });
     let snapshots = Arc::new(Semaphore::new(1));
     let mut socket = None;
-    while let Some(queued) = messages.recv().await {
-        ack_profile::finish("raft_outbound_queue", queued.enqueued_at);
+    let mut next = None;
+    let mut encoded = Vec::new();
+    let mut batch = Vec::with_capacity(RAFT_WRITE_BATCH_FRAMES);
+    loop {
+        let Some(queued) = (match next.take() {
+            Some(queued) => Some(queued),
+            None => messages.recv().await,
+        }) else {
+            break;
+        };
+        queued.record_dequeue();
         if matches!(&queued.packet, Packet::Raft(_, message) if message.get_msg_type() == MessageType::MsgSnapshot)
         {
             if let Ok(slot) = snapshots.clone().try_acquire_owned() {
@@ -469,41 +599,39 @@ async fn outbound(
             }
         }
         let connection = socket.as_mut().expect("connected");
-        let result = timeout(DEADLINE, async {
-            let (kind, group, data): (_, _, Bytes) = match &queued.packet {
-                Packet::Raft(key, message) => (2, Some(*key), message.write_to_bytes()?.into()),
-                Packet::Leaders(data) => (3, None, data.clone()),
-                Packet::Join => (4, None, Bytes::new()),
-                Packet::Drain => (5, None, Bytes::new()),
-                Packet::PeerReady(data) => (7, None, data.clone()),
-                Packet::RecoveryRequest(key, token) => {
-                    (9, Some(*key), Bytes::copy_from_slice(token.as_bytes()))
-                }
-                Packet::RecoveryStart(key, token, term, committed) => {
-                    let mut data = BytesMut::with_capacity(32);
-                    data.extend_from_slice(token.as_bytes());
-                    data.put_u64(*term);
-                    data.put_u64(*committed);
-                    (10, Some(*key), data.freeze())
-                }
-                Packet::Moved(id, movement) => {
-                    let mut body = BytesMut::with_capacity(MOVE);
-                    body.extend_from_slice(movement.key.topic.as_bytes());
-                    body.put_u32(movement.key.partition);
-                    body.put_u64(movement.from);
-                    body.put_u64(movement.to);
-                    body.extend_from_slice(id.as_bytes());
-                    (6, None, body.freeze())
-                }
+        let mut batch_bytes = queued._bytes.num_permits() + 4;
+        batch.push(queued);
+        for _ in 1..RAFT_WRITE_BATCH_FRAMES {
+            let Ok(queued) = messages.try_recv() else {
+                break;
             };
-            let (header, len) = remote.frame_header(kind, group, data.len())?;
-            connection
-                .write_all_buf(&mut Buf::chain(&header[..len], data))
-                .await?;
+            if matches!(&queued.packet, Packet::Raft(_, message)
+                if message.get_msg_type() == MessageType::MsgSnapshot)
+                || batch_bytes + queued._bytes.num_permits() + 4 > RAFT_WRITE_BATCH_BYTES
+            {
+                next = Some(queued);
+                break;
+            }
+            queued.record_dequeue();
+            batch_bytes += queued._bytes.num_permits() + 4;
+            batch.push(queued);
+        }
+        let result = timeout(DEADLINE, async {
+            for frame in &batch {
+                remote.encode_frame(&mut encoded, &frame.packet)?;
+            }
+            let started = ack_profile::start();
+            connection.write_all(&encoded).await?;
             connection.flush().await?;
+            ack_profile::finish("raft_socket_write", started);
             Ok::<_, anyhow::Error>(())
         })
         .await;
+        batch.clear();
+        encoded.clear();
+        if encoded.capacity() > RAFT_WRITE_BATCH_BYTES {
+            encoded = Vec::new();
+        }
         if !matches!(result, Ok(Ok(()))) {
             socket = None;
             sleep(Duration::from_millis(75)).await;
@@ -529,7 +657,7 @@ async fn inbound(
     bytes: Arc<Semaphore>,
 ) -> Result<()> {
     socket.set_nodelay(true)?;
-    let mut socket = timeout(DEADLINE, tls.accept(socket)).await??;
+    let socket = timeout(DEADLINE, tls.accept(socket)).await??;
     let leaf = socket
         .get_ref()
         .1
@@ -543,13 +671,16 @@ async fn inbound(
         .find(|(id, pinned)| **id != local && *pinned == leaf)
         .map(|(&id, _)| id)
         .context("unregistered node certificate")?;
+    let mut socket = AsyncBufReader::with_capacity(32 * 1024, socket);
     let mut pending = FuturesUnordered::<oneshot::Receiver<Result<()>>>::new();
     loop {
         while let Some(Some(reply)) = pending.next().now_or_never() {
             reply??;
         }
-        if pending.len() >= 16 {
+        if pending.len() >= RAFT_RECEIVE_PIPELINE {
+            let waited = ack_profile::start();
             pending.next().await.expect("full Raft pipeline")??;
+            ack_profile::finish("raft_receive_pipeline_wait", waited);
         }
         let frame = timeout(Duration::from_secs(30), socket.read_u32()).await?? as usize;
         ensure!(
@@ -604,28 +735,22 @@ async fn inbound(
                 {
                     let queued =
                         stage.and_then(|stage| ack_profile::start().map(|time| (stage, time)));
-                    let packet = (message, permit, queued);
+                    let waited = ack_profile::start();
                     let reply = cluster
                         .executor
-                        .submit(
-                            &cluster,
-                            key,
-                            packet,
-                            |partition, (message, _permit, queued)| {
-                                if let Some((stage, time)) = queued {
-                                    ack_profile::record(stage, time.elapsed());
-                                }
-                                partition.receive(message)
-                            },
-                            move |engine, (message, _permit, queued)| {
-                                if let Some((stage, time)) = queued {
-                                    ack_profile::record(stage, time.elapsed());
-                                }
-                                engine.receive(key, message)
-                            },
-                        )
+                        .submit_raft(&cluster, key, message, permit, queued)
                         .await?;
+                    ack_profile::finish("raft_receive_enqueue_wait", waited);
                     pending.push(reply);
+                    continue;
+                }
+                if !cluster.page_cache
+                    && is_group_shard(key)
+                    && message.get_msg_type() != MessageType::MsgSnapshot
+                {
+                    cluster
+                        .call_unfenced(move |engine| engine.receive(key, message))
+                        .await?;
                     continue;
                 }
                 wait_for_raft_admissions(&mut pending).await?;
@@ -760,6 +885,7 @@ mod tests {
     fn discarding_an_overflowing_frame_releases_its_byte_budget() {
         let (sender, mut receiver) = mpsc::channel(1);
         let budget = Arc::new(Semaphore::new(2 * HEADER));
+        let sender = PeerQueue::single(sender);
         Queued::send(&sender, &budget, Packet::Join);
         Queued::send(&sender, &budget, Packet::Drain);
         assert_eq!(budget.available_permits(), HEADER);

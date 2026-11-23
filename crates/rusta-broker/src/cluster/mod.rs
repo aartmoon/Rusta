@@ -379,6 +379,17 @@ impl Cluster {
         } else {
             Duration::from_micros(group_commit_us)
         };
+        let disk_workers = match std::env::var("RUSTA_DURABLE_DISK_WORKERS") {
+            Ok(workers) => workers
+                .parse::<usize>()
+                .context("invalid durable disk worker count")?,
+            Err(std::env::VarError::NotPresent) => executor::DEFAULT_DISK_WORKERS,
+            Err(error) => return Err(error.into()),
+        };
+        ensure!(
+            (1..=32).contains(&disk_workers),
+            "durable disk workers must be between 1 and 32"
+        );
         if page_cache {
             settings.cache_recovery = activate_page_cache(root, kernel_boot_id()?)?;
         }
@@ -388,7 +399,7 @@ impl Cluster {
         let outbound = routes.connect_all(&settings);
         let node = Engine::open(settings.clone(), root, outbound)?;
         let (produce_admissions, admissions) = mpsc::channel(64);
-        let executor = executor::Executor::new();
+        let executor = executor::Executor::new(disk_workers);
         let cluster = Arc::new(Self {
             data_available: node.data_available.clone(),
             group_progress: node.group_progress.clone(),
@@ -409,27 +420,62 @@ impl Cluster {
             admissions,
             group_commit_wait,
         ));
+        if !page_cache {
+            tokio::spawn(cluster.clone().tick_data_partitions());
+        }
         let ticking = cluster.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(50));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tick.tick().await;
-                match ticking.call(|engine| engine.tick_groups(true)).await {
-                    Ok(keys) => {
-                        for key in keys {
-                            ticking.executor.tick(&ticking, key);
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!("Raft timer stopped: {error:#}");
-                        break;
-                    }
+                if let Err(error) = ticking.tick_raft().await {
+                    eprintln!("Raft timer stopped: {error:#}");
+                    break;
                 }
                 ack_profile::report();
             }
         });
         Ok(cluster)
+    }
+
+    async fn tick_raft(self: &Arc<Self>) -> Result<()> {
+        if self.page_cache {
+            return self.call(Engine::tick_groups).await;
+        }
+        if self.call_unfenced(Engine::tick_durable).await? {
+            self.call(Engine::tick_durable_fenced).await?;
+        }
+        Ok(())
+    }
+
+    async fn tick_data_partitions(self: Arc<Self>) {
+        const PHASES: usize = 4;
+        let mut tick = tokio::time::interval(Duration::from_micros(50_000 / PHASES as u64));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut partitions: [Vec<_>; PHASES] = std::array::from_fn(|_| Vec::new());
+        let mut phase = 0;
+        loop {
+            tick.tick().await;
+            if phase == 0
+                && let Ok(slot) = self.engine.try_lock()
+            {
+                let Some(engine) = slot.as_ref().filter(|engine| !engine.closing) else {
+                    return;
+                };
+                for cohort in &mut partitions {
+                    cohort.clear();
+                }
+                for key in engine.data_tick_keys() {
+                    let cohort = (key.topic.as_u128() as usize ^ key.partition as usize) % PHASES;
+                    partitions[cohort].push(key);
+                }
+            }
+            for &key in &partitions[phase] {
+                self.executor.tick(&self, key);
+            }
+            phase = (phase + 1) % PHASES;
+        }
     }
 
     async fn stage_peer(self: &Arc<Self>, spec: String) -> Result<u64> {

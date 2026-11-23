@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{self, ErrorKind, IoSlice, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crc32c::{crc32c, crc32c_append};
@@ -248,13 +248,26 @@ pub(crate) fn write_entry(writer: &mut File, entry: Entry, payload: &[u8]) -> io
         checksum = crc32c_append(checksum, &payload[8..]);
     }
     header[32..].copy_from_slice(&checksum.to_be_bytes());
-    writer.write_all(&header)?;
-    if entry.record_count == 0 {
-        writer.write_all(payload)
+    let (offset, payload) = if entry.record_count == 0 {
+        (&[][..], payload)
     } else {
-        writer.write_all(&base_offset)?;
-        writer.write_all(&payload[8..])
+        (base_offset.as_slice(), &payload[8..])
+    };
+    let mut data = [
+        IoSlice::new(&header),
+        IoSlice::new(offset),
+        IoSlice::new(payload),
+    ];
+    let mut slices = &mut data[..];
+    while !slices.is_empty() {
+        match writer.write_vectored(slices) {
+            Ok(0) => return Err(io::Error::from(ErrorKind::WriteZero)),
+            Ok(written) => IoSlice::advance_slices(&mut slices, written),
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
     }
+    Ok(())
 }
 
 pub(crate) fn read_entry(

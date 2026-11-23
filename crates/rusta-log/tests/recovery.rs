@@ -43,6 +43,42 @@ fn durable_raft_manifest_upgrades_and_recovers_from_a_torn_slot() -> io::Result<
 }
 
 #[test]
+fn durable_recent_reads_match_disk_after_suffix_replacement() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let options = Options::default();
+    let mut log = PartitionLog::open_raft_durable(dir.path(), options)?;
+    log.append_batch(1, 100, &batch(&[(100, 1)]))?;
+    log.commit()?;
+    let old = log.append_batch(1, 101, &batch(&[(101, 2)]))?;
+    log.sync()?;
+
+    let mut cached = Vec::new();
+    assert!(log.batch_at(1, &mut cached)?.is_none());
+    assert_eq!(log.term(old.position.next_index)?, 1);
+    log.truncate_suffix(old.position.next_index)?;
+    let replacement = log.append_batch(2, 102, &batch(&[(102, 3)]))?;
+    log.commit()?;
+    assert_eq!(log.term(old.position.next_index)?, 2);
+    let read = log.batch_at(1, &mut cached)?.expect("replacement batch");
+    assert_eq!(
+        (read.position, read.term),
+        (replacement.position, replacement.term)
+    );
+    assert_eq!(&cached[..8], &1_i64.to_be_bytes());
+
+    drop(log);
+    let reopened = PartitionLog::open_raft_durable(dir.path(), options)?;
+    let mut disk = Vec::new();
+    let read = reopened.batch_at(1, &mut disk)?.expect("replacement batch");
+    assert_eq!(
+        (read.position, read.term),
+        (replacement.position, replacement.term)
+    );
+    assert_eq!(cached, disk);
+    Ok(())
+}
+
+#[test]
 fn cached_progress_survives_process_reopen_and_can_be_flushed() -> io::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut log = PartitionLog::open(dir.path(), Options::default())?;

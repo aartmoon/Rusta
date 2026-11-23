@@ -4,6 +4,7 @@
 mod format;
 mod segment;
 
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -41,6 +42,42 @@ pub struct Retention {
     pub max_bytes: Option<u64>,
 }
 
+// Keep a bounded suffix of the in-process Raft log for term lookups, replication,
+// and consumers reading near the high watermark.
+const RECENT_BYTES: usize = 256 * 1024;
+const RECENT_ENTRIES: usize = 64;
+
+#[derive(Default)]
+struct RecentEntries {
+    entries: VecDeque<(Entry, Vec<u8>)>,
+    bytes: usize,
+}
+
+impl RecentEntries {
+    fn push(&mut self, entry: Entry, payload: &[u8]) {
+        if payload.len() > RECENT_BYTES {
+            *self = Self::default();
+            return;
+        }
+        while self.bytes + payload.len() > RECENT_BYTES || self.entries.len() == RECENT_ENTRIES {
+            let (_, removed) = self.entries.pop_front().expect("recent entries have bytes");
+            self.bytes -= removed.len();
+        }
+        let mut payload = payload.to_vec();
+        if entry.record_count != 0 {
+            payload[..8].copy_from_slice(&entry.position.next_offset.to_be_bytes());
+        }
+        self.bytes += payload.len();
+        self.entries.push_back((entry, payload));
+    }
+
+    fn suffix(&self, index: u64) -> Option<impl Iterator<Item = &(Entry, Vec<u8>)>> {
+        let first = self.entries.front()?.0.position.next_index;
+        let skip = usize::try_from(index.checked_sub(first)?).ok()?;
+        (skip < self.entries.len()).then(|| self.entries.iter().skip(skip))
+    }
+}
+
 /// A single partition opened exclusively. Mutation methods require the caller to serialize work.
 pub struct PartitionLog {
     root: PathBuf,
@@ -48,6 +85,7 @@ pub struct PartitionLog {
     checkpoint: Checkpoint,
     segments: Vec<Segment>,
     writer: Option<File>,
+    recent: RecentEntries,
     page_cache: bool,
     needs_flush: bool,
     stable_manifest: bool,
@@ -173,6 +211,7 @@ impl PartitionLog {
             checkpoint,
             segments,
             writer: None,
+            recent: RecentEntries::default(),
             page_cache: false,
             needs_flush: false,
             stable_manifest: cache.is_some(),
@@ -347,6 +386,9 @@ impl PartitionLog {
                 .last_mut()
                 .expect("active segment exists")
                 .push(entry, next, record_timestamp);
+            if log.progress_manifest.is_some() {
+                log.recent.push(entry, payload);
+            }
             Ok(entry)
         })
     }
@@ -421,6 +463,35 @@ impl PartitionLog {
         })
     }
 
+    pub fn has_durable_raft_manifest(&self) -> bool {
+        self.progress_manifest.is_some()
+    }
+
+    /// Apply a data-only quorum commit to the live log. The appended entries
+    /// have already been synced. Recovery can rediscover their commit through
+    /// Raft if the next manifest write does not survive.
+    pub fn publish_raft_commit(&mut self, next_index: u64) -> io::Result<()> {
+        self.ensure_available()?;
+        if !self.has_durable_raft_manifest()
+            || !(self.committed().next_index..=self.durable().next_index).contains(&next_index)
+        {
+            return Err(invalid("Raft commit must extend the durable prefix"));
+        }
+        if next_index != self.committed().next_index {
+            self.checkpoint.committed = self.position_at(next_index)?;
+        }
+        Ok(())
+    }
+
+    /// Synchronize live Raft progress before saving an application checkpoint.
+    pub fn sync_raft_progress(&mut self) -> io::Result<()> {
+        self.ensure_available()?;
+        if self.has_durable_raft_manifest() {
+            self.mutate(|log| log.save_progress(log.checkpoint))?;
+        }
+        Ok(())
+    }
+
     /// Set a copied partition's offset base before its first consensus entry.
     pub fn initialize_offset(&mut self, offset: i64) -> io::Result<()> {
         self.ensure_available()?;
@@ -477,6 +548,7 @@ impl PartitionLog {
             };
             log.save(checkpoint)?;
             log.segments = recover(&log.root, checkpoint, &list(&log.root)?)?;
+            log.recent = RecentEntries::default();
             Ok(())
         })
     }
@@ -506,6 +578,7 @@ impl PartitionLog {
                 ..log.checkpoint
             };
             log.segments = recover(&log.root, boundary, &list(&log.root)?)?;
+            log.recent = RecentEntries::default();
             if log.durable().next_index < retained.next_index {
                 // Recovery synced the truncation, but the preserved staged prefix still needs sync.
                 let active = log.segments.last().expect("preserved staged entries");
@@ -517,6 +590,27 @@ impl PartitionLog {
             }
             Ok(())
         })
+    }
+
+    /// Size of the requested committed suffix when it is present in the recent cache.
+    pub fn recent_batch_bytes(&self, offset: i64) -> Option<usize> {
+        let committed = self.committed();
+        let first = self.recent.entries.front()?.0.position;
+        if offset < first.next_offset || offset >= committed.next_offset {
+            return None;
+        }
+        Some(
+            self.recent
+                .entries
+                .iter()
+                .take_while(|(entry, _)| entry.position.next_index < committed.next_index)
+                .filter(|(entry, _)| {
+                    entry.record_count > 0
+                        && entry.position.next_offset + i64::from(entry.record_count) > offset
+                })
+                .map(|(_, payload)| payload.len())
+                .sum(),
+        )
     }
 
     /// Read the committed batch containing an offset. Pass a reusable payload buffer.
@@ -544,6 +638,31 @@ impl PartitionLog {
         }
         if offset == self.committed().next_offset {
             payload.clear();
+            return Ok(());
+        }
+
+        let committed = self.committed().next_index;
+        if self
+            .recent
+            .entries
+            .front()
+            .is_some_and(|(entry, _)| entry.position.next_offset <= offset)
+        {
+            for (entry, cached) in &self.recent.entries {
+                if entry.position.next_index >= committed {
+                    break;
+                }
+                if entry.record_count == 0
+                    || entry.position.next_offset + i64::from(entry.record_count) <= offset
+                {
+                    continue;
+                }
+                payload.clear();
+                payload.extend_from_slice(cached);
+                if !visit(*entry, payload)? {
+                    break;
+                }
+            }
             return Ok(());
         }
 
@@ -636,6 +755,33 @@ impl PartitionLog {
         Ok(None)
     }
 
+    /// Check whether applying the durable uncommitted suffix needs only cached user data.
+    pub fn has_cached_data_suffix(&self, max_bytes: usize) -> bool {
+        let from = self.committed().next_index;
+        if self.end() != self.durable() {
+            return false;
+        }
+        if from == self.durable().next_index {
+            return true;
+        }
+        let Some(entries) = self.recent.suffix(from) else {
+            return false;
+        };
+        let mut bytes = 0;
+        for (entry, payload) in entries {
+            bytes += payload.len();
+            if bytes > max_bytes || entry.record_count == 0 || entry.append_timestamp_ms == 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn has_cached_term(&self, index: u64) -> bool {
+        index == self.start().next_index - 1
+            || (index >= self.start().next_index && self.recent.suffix(index).is_some())
+    }
+
     /// Read the Raft term at an index, including the boundary immediately before retained entries.
     pub fn term(&self, index: u64) -> io::Result<u64> {
         self.ensure_available()?;
@@ -672,6 +818,24 @@ impl PartitionLog {
         }
 
         let mut bytes = 0_u64;
+        let mut accept = |entry: Entry, payload: &[u8]| -> io::Result<Option<u64>> {
+            let index = entry.position.next_index;
+            let total = bytes.saturating_add(HEADER_LEN + u64::from(entry.payload_len));
+            if bytes != 0 && total > byte_budget {
+                return Ok(Some(index));
+            }
+            visit(entry, payload)?;
+            bytes = total;
+            Ok((index + 1 == end || bytes >= byte_budget).then_some(index + 1))
+        };
+        if let Some(entries) = self.recent.suffix(first) {
+            for (entry, payload) in entries {
+                if let Some(next) = accept(*entry, payload)? {
+                    return Ok(next);
+                }
+            }
+            return Err(corrupt("requested entries are missing"));
+        }
         let mut payload = Vec::new();
         let start = self
             .segments
@@ -684,14 +848,8 @@ impl PartitionLog {
                 if index < first {
                     continue;
                 }
-                let total = bytes.saturating_add(HEADER_LEN + u64::from(entry.payload_len));
-                if bytes != 0 && total > byte_budget {
-                    return Ok(index);
-                }
-                visit(entry, &payload)?;
-                bytes = total;
-                if index + 1 == end || bytes >= byte_budget {
-                    return Ok(index + 1);
+                if let Some(next) = accept(entry, &payload)? {
+                    return Ok(next);
                 }
             }
         }
