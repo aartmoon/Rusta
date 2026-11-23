@@ -2,6 +2,10 @@
 
 The comparison uses fixed offered load and checks delivered records and consumer progress. It reports the profile and acknowledgment boundary alongside every result. Rusta runs the same image for its single-broker and Raft profiles.
 
+## RF3 24-partition best result
+
+Rusta durable recorded a best observed **43.3 ms ACK p95** at 10,000 offered messages/s with 24 partitions and a 1 KiB mixed workload. This is the best measured 60-second window from the benchmark series, not a repeatability estimate. See the [Rusta-only benchmark report](benchmarks/rf3-24p-10k-2026-11-23.md) for the run configuration and measurements.
+
 ## Current local RF3 comparison
 
 The 2026-11-22 UTC run compared Rusta with independent durable partition queues, Redpanda 26.3.1 in durable mode, and Kafka 4.1.2 with forced topic flush sequentially on the same Apple Silicon Docker VM. Each profile used three brokers, one vCPU and 1 GiB per broker, and the same Java Kafka client with idempotence and `acks=all`. The runner verified Redpanda's `fsync` process flag and the topic's disabled write caching. Kafka's forced flush still uses ISR acknowledgment semantics. [Raw JSON, gzip](benchmarks/durable-executor-comparison.json.gz)

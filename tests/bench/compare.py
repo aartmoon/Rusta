@@ -105,6 +105,8 @@ class Cluster:
             environment["RUSTA_INTERNAL_BIND"] = "0.0.0.0:29092"
             environment["RUSTA_INTERNAL_ADVERTISED"] = f"{node}:29092"
             if rf > 1:
+                if self.options.rusta_disk_workers is not None:
+                    environment["RUSTA_DURABLE_DISK_WORKERS"] = str(self.options.rusta_disk_workers)
                 if self.options.rusta_group_commit_us:
                     environment["RUSTA_DURABLE_GROUP_COMMIT_US"] = str(self.options.rusta_group_commit_us)
                 if self.options.rusta_ack_profile:
@@ -297,6 +299,8 @@ def main():
     parser.add_argument("--rusta-image", default=IMAGES["rusta"])
     parser.add_argument("--rusta-group-commit-us", type=int, default=0,
                         metavar="0..2000", help="batching wait under load for Rusta durable")
+    parser.add_argument("--rusta-disk-workers", type=int, choices=range(1, 33), metavar="1..32",
+                        help="override the Rusta durable partition worker count")
     parser.add_argument("--rusta-ack-profile", action="store_true",
                         help="record Rusta RF3 ACK stage histograms in broker logs")
     parser.add_argument("--repeat", type=int, default=2)
@@ -338,6 +342,7 @@ def main():
         "workloads": options.workloads,
         "repetitions": options.repeat, "linger_ms": options.linger_ms,
         "rusta_ack_profile": options.rusta_ack_profile,
+        "rusta_disk_workers": options.rusta_disk_workers,
         "rusta_group_commit_us": options.rusta_group_commit_us,
         "fetch_max_wait_ms": options.fetch_max_wait_ms,
     }

@@ -150,6 +150,7 @@ public final class ResourceProbe {
         long measuredNanos = 0;
         long readStart = 0, readEnd = 0, ackStart = 0, ackEnd = 0;
         var sentDuring = 0L;
+        long peakUnread = 0;
         String clientMetrics;
         try (var p = new KafkaProducer<>(properties, new ByteArraySerializer(), new ByteArraySerializer())) {
             for (int slot = 0; slot < (duration + 4) * 100; slot++) {
@@ -183,6 +184,7 @@ public final class ResourceProbe {
                     });
                     if (measured) sentDuring++;
                 }
+                if (read && measured) peakUnread = Math.max(peakUnread, sent.get() - readCount.get());
             }
             readEnd = readCount.get();
             ackEnd = acks.get();
@@ -206,9 +208,9 @@ public final class ResourceProbe {
             : "null";
         double seconds = measuredNanos / 1e9;
         System.out.printf(Locale.ROOT,
-            "{\"seconds\":%.3f,\"sent_total\":%d,\"acked_total\":%d,\"consumed_and_committed_total\":%d,\"offered_msg_s\":%.1f,\"acked_msg_s\":%.1f,\"consumed_msg_s\":%.1f,\"p50_ms\":%.3f,\"p95_ms\":%.3f,\"p99_ms\":%.3f,\"ack_samples\":%d,\"end_to_end_samples\":%d,\"end_to_end_p99_ms\":%s,\"submitted_unread_at_window_end\":%d,\"producer_metrics\":%s}%n",
+            "{\"seconds\":%.3f,\"sent_total\":%d,\"acked_total\":%d,\"consumed_and_committed_total\":%d,\"offered_msg_s\":%.1f,\"acked_msg_s\":%.1f,\"consumed_msg_s\":%.1f,\"p50_ms\":%.3f,\"p95_ms\":%.3f,\"p99_ms\":%.3f,\"ack_samples\":%d,\"end_to_end_samples\":%d,\"end_to_end_p99_ms\":%s,\"submitted_unread_at_window_start\":%d,\"submitted_unread_at_window_end\":%d,\"peak_submitted_unread\":%d,\"producer_metrics\":%s}%n",
             seconds, sent.get(), acks.get(), committed.get(), sentDuring / seconds, (ackEnd - ackStart) / seconds, (readEnd - readStart) / seconds,
             lat[(int)(lat.length * .50)] / 1e6, lat[(int)(lat.length * .95)] / 1e6, lat[(int)(lat.length * .99)] / 1e6,
-            lat.length, e2e.length, e2eP99, read ? sent.get() - readEnd : 0L, clientMetrics);
+            lat.length, e2e.length, e2eP99, read ? warmupRecords - readStart : 0L, read ? sent.get() - readEnd : 0L, peakUnread, clientMetrics);
     }
 }
